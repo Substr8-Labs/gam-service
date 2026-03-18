@@ -107,7 +107,7 @@ class SearchRequest(BaseModel):
     query: str
     limit: int = 10
     customer_id: Optional[str] = None
-    min_similarity: float = 0.3
+    min_similarity: float = 0.1
 
 
 class SearchResult(BaseModel):
