@@ -102,3 +102,4 @@ To use this as Ada's memory system:
 - Consider adding auth to the API
 - For >1M entries, tune pgvector index (adjust `lists` parameter)
 - Embeddings cost ~$0.02 per 1M tokens
+# trigger rebuild 1773872077
