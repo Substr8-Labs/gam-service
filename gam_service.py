@@ -337,3 +337,28 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8091"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+@app.get("/debug/embedding-status")
+def embedding_status(agent_id: str = "ada"):
+    """Debug endpoint to check embedding status."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(embedding) as with_embedding,
+                COUNT(*) - COUNT(embedding) as without_embedding
+            FROM memory_entries 
+            WHERE agent_id = %s
+        """, (agent_id,))
+        row = cur.fetchone()
+        return {
+            "agent_id": agent_id,
+            "total": row[0],
+            "with_embedding": row[1],
+            "without_embedding": row[2]
+        }
+    finally:
+        cur.close()
+        conn.close()
