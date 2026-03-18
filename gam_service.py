@@ -362,3 +362,56 @@ def embedding_status(agent_id: str = "ada"):
     finally:
         cur.close()
         conn.close()
+
+
+class BatchEntry(BaseModel):
+    file_path: str
+    content: str
+    commit_hash: str = None
+    committed_at: str = None
+
+
+class BatchIngestRequest(BaseModel):
+    agent_id: str
+    entries: List[BatchEntry]
+
+
+@app.post("/batch")
+def batch_ingest(request: BatchIngestRequest):
+    """Batch ingest content directly (no git repo required)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    openai_client = get_openai_client()
+    
+    inserted = 0
+    try:
+        for entry in request.entries:
+            commit_hash = entry.commit_hash or f"batch-{hash(entry.content) & 0xffffffff:08x}"
+            committed_at = entry.committed_at or datetime.now(timezone.utc).isoformat()
+            content_hash = hashlib.sha256(entry.content.encode()).hexdigest()
+            
+            # Check if already exists
+            cur.execute(
+                "SELECT 1 FROM memory_entries WHERE content_hash = %s AND agent_id = %s",
+                (content_hash, request.agent_id)
+            )
+            if cur.fetchone():
+                continue
+            
+            # Generate embedding
+            embedding = generate_embedding(openai_client, entry.content[:8000])
+            
+            cur.execute("""
+                INSERT INTO memory_entries 
+                (commit_hash, file_path, content, agent_id, committed_at, embedding, content_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (content_hash, agent_id) DO NOTHING
+            """, (commit_hash, entry.file_path, entry.content, request.agent_id, 
+                  committed_at, embedding, content_hash))
+            inserted += 1
+        
+        conn.commit()
+        return {"inserted": inserted, "total": len(request.entries)}
+    finally:
+        cur.close()
+        conn.close()
