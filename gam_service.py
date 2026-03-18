@@ -258,7 +258,7 @@ def search_memory(request: SearchRequest):
                    1 - (embedding <=> %s::vector) as similarity
             FROM memory_entries
             WHERE agent_id = %s
-              AND ($1 IS NULL OR customer_id = %s)
+              AND (%s IS NULL OR customer_id = %s)
               AND embedding IS NOT NULL
               AND 1 - (embedding <=> %s::vector) >= %s
             ORDER BY embedding <=> %s::vector
@@ -266,6 +266,7 @@ def search_memory(request: SearchRequest):
         """, (
             query_embedding, 
             request.agent_id, 
+            request.customer_id,
             request.customer_id,
             query_embedding,
             request.min_similarity,
