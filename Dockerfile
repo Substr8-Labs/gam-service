@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY gam_service.py .
 
+ENV PORT=8091
 EXPOSE 8091
 
 CMD ["python", "gam_service.py"]
