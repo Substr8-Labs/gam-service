@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: gam-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gam
+      POSTGRES_PASSWORD: ${GAM_DB_PASSWORD:-gam_dev_password}
+      POSTGRES_DB: gam
+    volumes:
+      - gam_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5433:5432"  # Non-standard port to avoid conflicts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gam -d gam"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gam-service:
+    build: .
+    container_name: gam-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GAM_DB_HOST: postgres
+      GAM_DB_PORT: 5432
+      GAM_DB_USER: gam
+      GAM_DB_PASSWORD: ${GAM_DB_PASSWORD:-gam_dev_password}
+      GAM_DB_NAME: gam
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    volumes:
+      # Mount repos to index - add your repos here
+      - /home/claw/.openclaw/workspace:/repos/ada-workspace:ro
+    ports:
+      - "8091:8091"
+
+volumes:
+  gam_data:
