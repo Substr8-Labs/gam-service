@@ -8,7 +8,7 @@ GAM pgvector Service
 import os
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from pathlib import Path
 
