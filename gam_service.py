@@ -401,7 +401,7 @@ def batch_ingest(request: BatchIngestRequest):
                 INSERT INTO memory_entries 
                 (commit_hash, file_path, content, agent_id, committed_at, embedding, content_hash)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (content_hash, agent_id) DO NOTHING
+                
             """, (commit_hash, entry.file_path, entry.content, request.agent_id, 
                   committed_at, embedding, content_hash))
             inserted += 1
