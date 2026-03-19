@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Force rebuild on every deploy
+ARG CACHEBUST=1
+
 WORKDIR /app
 
 # Install git for GitPython

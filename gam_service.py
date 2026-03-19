@@ -333,10 +333,6 @@ def get_stats(agent_id: str = Query(...)):
         conn.close()
 
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8091"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
 
 @app.get("/debug/embedding-status")
 def embedding_status(agent_id: str = "ada"):
@@ -415,3 +411,9 @@ def batch_ingest(request: BatchIngestRequest):
     finally:
         cur.close()
         conn.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8091"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
