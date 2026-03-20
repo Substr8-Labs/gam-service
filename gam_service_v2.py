@@ -995,6 +995,282 @@ def index_repo():
     """Placeholder for git repo indexing."""
     return {"status": "not_implemented", "message": "Use /batch or /memory for direct ingestion"}
 
+# ============================================================
+# New MCP v1 Endpoints
+# ============================================================
+
+class ContextRequest(BaseModel):
+    task: str
+    max_tokens: int = 2000
+    include_decisions: bool = True
+    include_milestones: bool = True
+
+@app.post("/context")
+def build_context(request: ContextRequest, tenant: dict = Depends(get_tenant)):
+    """Build a context pack for a task."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
+    
+    if not tenant:
+        metrics.inc("gam_auth_error_total")
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("context.build.started",
+             correlation_id=correlation_id,
+             tenant_id=str(tenant['id']),
+             task_length=len(request.task),
+             max_tokens=request.max_tokens)
+    
+    metrics.inc("gam_context_build_total", {"tenant": tenant['name']})
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Generate embedding for task
+            task_embedding = generate_embedding(request.task, correlation_id)
+            
+            # Build filter for memory kinds
+            kinds_filter = []
+            if request.include_decisions:
+                kinds_filter.append("'decision'")
+            if request.include_milestones:
+                kinds_filter.append("'milestone'")
+            kinds_filter.extend(["'note'", "'task'"])
+            kinds_sql = f"memory_kind IN ({','.join(kinds_filter)})"
+            
+            # Search for relevant memories with preference for high salience
+            cur.execute(f"""
+                SELECT 
+                    id, content, memory_kind, salience_score,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM memory_entries
+                WHERE tenant_id = %s
+                  AND embedding IS NOT NULL
+                  AND {kinds_sql}
+                  AND 1 - (embedding <=> %s::vector) >= 0.2
+                ORDER BY 
+                    (1 - (embedding <=> %s::vector)) * 0.7 + salience_score * 0.3 DESC
+                LIMIT 20
+            """, (task_embedding, tenant['id'], task_embedding, task_embedding))
+            
+            rows = cur.fetchall()
+            
+            # Build context pack with token limit
+            context_parts = []
+            memory_ids = []
+            estimated_tokens = 0
+            
+            # Group by kind
+            decisions = [r for r in rows if r['memory_kind'] == 'decision']
+            milestones = [r for r in rows if r['memory_kind'] == 'milestone']
+            other = [r for r in rows if r['memory_kind'] not in ('decision', 'milestone')]
+            
+            # Add decisions first (most important)
+            if decisions and request.include_decisions:
+                context_parts.append("## Relevant Decisions\n")
+                for r in decisions[:5]:
+                    content = r['content'][:500]
+                    tokens = len(content) // 4
+                    if estimated_tokens + tokens > request.max_tokens:
+                        break
+                    context_parts.append(f"- {content}\n")
+                    memory_ids.append(r['id'])
+                    estimated_tokens += tokens
+                context_parts.append("\n")
+            
+            # Add milestones
+            if milestones and request.include_milestones:
+                context_parts.append("## Recent Milestones\n")
+                for r in milestones[:3]:
+                    content = r['content'][:300]
+                    tokens = len(content) // 4
+                    if estimated_tokens + tokens > request.max_tokens:
+                        break
+                    context_parts.append(f"- {content}\n")
+                    memory_ids.append(r['id'])
+                    estimated_tokens += tokens
+                context_parts.append("\n")
+            
+            # Add other context
+            if other:
+                context_parts.append("## Related Context\n")
+                for r in other[:5]:
+                    content = r['content'][:300]
+                    tokens = len(content) // 4
+                    if estimated_tokens + tokens > request.max_tokens:
+                        break
+                    context_parts.append(f"- {content}\n")
+                    memory_ids.append(r['id'])
+                    estimated_tokens += tokens
+            
+            context = "".join(context_parts)
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            log.info("context.build.completed",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant['id']),
+                     memory_count=len(memory_ids),
+                     token_count=estimated_tokens,
+                     duration_ms=duration_ms)
+            
+            metrics.observe("gam_context_build_duration_ms", duration_ms, {"tenant": tenant['name']})
+            
+            return {
+                "context": context,
+                "memory_ids": memory_ids,
+                "token_count": estimated_tokens
+            }
+            
+        finally:
+            cur.close()
+
+@app.post("/memory/{memory_id}/pin")
+def pin_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Pin a memory (set salience to 1.0)."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
+    
+    if not tenant:
+        metrics.inc("gam_auth_error_total")
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("memory.pin.started",
+             correlation_id=correlation_id,
+             tenant_id=str(tenant['id']),
+             memory_id=memory_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Get current state
+            cur.execute("""
+                SELECT id, salience_score, metadata 
+                FROM memory_entries 
+                WHERE id = %s AND tenant_id = %s
+            """, (memory_id, tenant['id']))
+            
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            previous_salience = row['salience_score']
+            metadata = row['metadata'] or {}
+            metadata['pinned'] = True
+            metadata['pinned_at'] = datetime.now(timezone.utc).isoformat()
+            
+            # Update salience to 1.0 and mark as pinned
+            cur.execute("""
+                UPDATE memory_entries 
+                SET salience_score = 1.0, metadata = %s
+                WHERE id = %s AND tenant_id = %s
+            """, (json.dumps(metadata), memory_id, tenant['id']))
+            
+            conn.commit()
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            log.info("memory.pin.completed",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant['id']),
+                     memory_id=memory_id,
+                     previous_salience=previous_salience,
+                     duration_ms=duration_ms)
+            
+            metrics.inc("gam_governance_pin_total", {"tenant": tenant['name']})
+            
+            return {
+                "memory_id": memory_id,
+                "status": "pinned",
+                "previous_salience": previous_salience,
+                "new_salience": 1.0
+            }
+            
+        finally:
+            cur.close()
+
+@app.get("/memory/{memory_id}/related")
+def get_related(memory_id: int, limit: int = 5, tenant: dict = Depends(get_tenant)):
+    """Get memories related to a given memory."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
+    
+    if not tenant:
+        metrics.inc("gam_auth_error_total")
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("memory.related.started",
+             correlation_id=correlation_id,
+             tenant_id=str(tenant['id']),
+             memory_id=memory_id,
+             limit=limit)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Get source memory
+            cur.execute("""
+                SELECT id, content, memory_kind, embedding, salience_score
+                FROM memory_entries 
+                WHERE id = %s AND tenant_id = %s
+            """, (memory_id, tenant['id']))
+            
+            source = cur.fetchone()
+            if not source:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            if not source['embedding']:
+                raise HTTPException(status_code=400, detail="Memory has no embedding")
+            
+            # Find related by semantic similarity
+            cur.execute("""
+                SELECT 
+                    id, content, memory_kind, salience_score,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM memory_entries
+                WHERE tenant_id = %s
+                  AND id != %s
+                  AND embedding IS NOT NULL
+                  AND 1 - (embedding <=> %s::vector) >= 0.3
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (source['embedding'], tenant['id'], memory_id, 
+                  source['embedding'], source['embedding'], limit))
+            
+            related = []
+            for row in cur.fetchall():
+                related.append({
+                    "id": row['id'],
+                    "content": row['content'][:500],
+                    "kind": row['memory_kind'],
+                    "relation": "semantic_similarity",
+                    "score": round(row['similarity'], 4)
+                })
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            log.info("memory.related.completed",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant['id']),
+                     memory_id=memory_id,
+                     related_count=len(related),
+                     duration_ms=duration_ms)
+            
+            metrics.inc("gam_related_query_total", {"tenant": tenant['name']})
+            
+            return {
+                "source_memory": {
+                    "id": source['id'],
+                    "content": source['content'][:500],
+                    "kind": source['memory_kind']
+                },
+                "related": related
+            }
+            
+        finally:
+            cur.close()
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8091"))
