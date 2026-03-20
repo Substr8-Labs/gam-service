@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.1.0"
+SERVICE_VERSION = "2.2.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
@@ -1272,6 +1272,565 @@ def get_related(memory_id: int, limit: int = 5, tenant: dict = Depends(get_tenan
             
         finally:
             cur.close()
+
+# ============================================================
+# Admin Endpoints (Milestone C)
+# ============================================================
+
+@app.get("/admin/tenants")
+def admin_list_tenants(tenant: dict = Depends(get_tenant)):
+    """List all tenants with stats."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.tenants.list", correlation_id=correlation_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("""
+                SELECT 
+                    t.id, t.name, t.created_at,
+                    COUNT(m.id) as memory_count,
+                    COUNT(CASE WHEN m.metadata->>'pinned' = 'true' THEN 1 END) as pinned_count,
+                    COUNT(CASE WHEN m.metadata->>'suppressed' = 'true' THEN 1 END) as suppressed_count,
+                    COUNT(CASE WHEN m.memory_kind = 'decision' THEN 1 END) as decision_count,
+                    COUNT(CASE WHEN m.memory_kind = 'milestone' THEN 1 END) as milestone_count
+                FROM tenants t
+                LEFT JOIN memory_entries m ON t.id = m.tenant_id
+                GROUP BY t.id, t.name, t.created_at
+                ORDER BY t.name
+            """)
+            
+            tenants = []
+            for row in cur.fetchall():
+                tenants.append({
+                    "id": str(row['id']),
+                    "name": row['name'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                    "stats": {
+                        "total": row['memory_count'],
+                        "pinned": row['pinned_count'],
+                        "suppressed": row['suppressed_count'],
+                        "decisions": row['decision_count'],
+                        "milestones": row['milestone_count']
+                    }
+                })
+            
+            return {"tenants": tenants}
+        finally:
+            cur.close()
+
+
+@app.get("/admin/memories")
+def admin_list_memories(
+    tenant_id: Optional[str] = None,
+    kind: Optional[str] = None,
+    min_salience: Optional[float] = None,
+    pinned: Optional[bool] = None,
+    suppressed: bool = False,
+    q: Optional[str] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = 0,
+    sort: str = "created_at",
+    order: str = "desc",
+    tenant: dict = Depends(get_tenant)
+):
+    """Paginated memory list with filters."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memories.list", 
+             correlation_id=correlation_id,
+             tenant_id=tenant_id,
+             kind=kind,
+             limit=limit,
+             offset=offset)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Build query
+            where_clauses = []
+            params = []
+            
+            if tenant_id:
+                where_clauses.append("tenant_id = %s")
+                params.append(tenant_id)
+            
+            if kind and kind != "all":
+                where_clauses.append("memory_kind = %s")
+                params.append(kind)
+            
+            if min_salience is not None:
+                where_clauses.append("salience_score >= %s")
+                params.append(min_salience)
+            
+            if pinned is True:
+                where_clauses.append("metadata->>'pinned' = 'true'")
+            
+            if not suppressed:
+                where_clauses.append("(metadata->>'suppressed' IS NULL OR metadata->>'suppressed' != 'true')")
+            
+            if q:
+                where_clauses.append("content ILIKE %s")
+                params.append(f"%{q}%")
+            
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+            
+            # Validate sort column
+            valid_sorts = {"created_at": "committed_at", "salience": "salience_score", "id": "id"}
+            sort_col = valid_sorts.get(sort, "committed_at")
+            order_dir = "DESC" if order.lower() == "desc" else "ASC"
+            
+            # Count total
+            cur.execute(f"SELECT COUNT(*) FROM memory_entries WHERE {where_sql}", params)
+            total = cur.fetchone()['count']
+            
+            # Fetch page
+            cur.execute(f"""
+                SELECT 
+                    m.id, m.content, m.memory_kind, m.source_channel,
+                    m.committed_at, m.salience_score, m.metadata,
+                    t.name as tenant_name, t.id as tenant_id
+                FROM memory_entries m
+                JOIN tenants t ON m.tenant_id = t.id
+                WHERE {where_sql}
+                ORDER BY {sort_col} {order_dir}
+                LIMIT %s OFFSET %s
+            """, params + [limit, offset])
+            
+            memories = []
+            for row in cur.fetchall():
+                metadata = row['metadata'] or {}
+                memories.append({
+                    "id": row['id'],
+                    "content": row['content'][:300] + "..." if len(row['content']) > 300 else row['content'],
+                    "kind": row['memory_kind'],
+                    "source": row['source_channel'],
+                    "created_at": row['committed_at'].isoformat() if row['committed_at'] else None,
+                    "salience": row['salience_score'],
+                    "pinned": metadata.get('pinned', False),
+                    "suppressed": metadata.get('suppressed', False),
+                    "tenant": {
+                        "id": str(row['tenant_id']),
+                        "name": row['tenant_name']
+                    }
+                })
+            
+            return {
+                "data": memories,
+                "meta": {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "tenant_id": tenant_id
+                }
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/memories/{memory_id}")
+def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Full memory detail with provenance."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memory.detail", correlation_id=correlation_id, memory_id=memory_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("""
+                SELECT 
+                    m.id, m.content, m.memory_kind, m.source_channel,
+                    m.committed_at, m.salience_score, m.metadata,
+                    m.embedding IS NOT NULL as has_embedding,
+                    m.file_path,
+                    t.name as tenant_name, t.id as tenant_id
+                FROM memory_entries m
+                JOIN tenants t ON m.tenant_id = t.id
+                WHERE m.id = %s
+            """, (memory_id,))
+            
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            metadata = row['metadata'] or {}
+            content_hash = hashlib.sha256(row['content'].encode()).hexdigest()[:16]
+            
+            # Get related memories
+            related = []
+            if row['has_embedding']:
+                cur.execute("""
+                    WITH source AS (
+                        SELECT embedding FROM memory_entries WHERE id = %s
+                    )
+                    SELECT 
+                        m.id, m.content, m.memory_kind,
+                        1 - (m.embedding <=> source.embedding) as similarity
+                    FROM memory_entries m, source
+                    WHERE m.tenant_id = %s
+                      AND m.id != %s
+                      AND m.embedding IS NOT NULL
+                      AND 1 - (m.embedding <=> source.embedding) >= 0.3
+                    ORDER BY m.embedding <=> source.embedding
+                    LIMIT 5
+                """, (memory_id, row['tenant_id'], memory_id))
+                
+                for rel in cur.fetchall():
+                    related.append({
+                        "id": rel['id'],
+                        "score": round(rel['similarity'], 4),
+                        "preview": rel['content'][:100] + "..." if len(rel['content']) > 100 else rel['content'],
+                        "kind": rel['memory_kind']
+                    })
+            
+            return {
+                "id": row['id'],
+                "content": row['content'],
+                "memory_kind": row['memory_kind'],
+                "source_channel": row['source_channel'],
+                "created_at": row['committed_at'].isoformat() if row['committed_at'] else None,
+                "tenant": {
+                    "id": str(row['tenant_id']),
+                    "name": row['tenant_name']
+                },
+                "salience": {
+                    "score": row['salience_score'],
+                    "pinned": metadata.get('pinned', False),
+                    "pinned_at": metadata.get('pinned_at'),
+                    "previous_score": metadata.get('previous_salience')
+                },
+                "provenance": {
+                    "memory_id": row['id'],
+                    "tenant_id": str(row['tenant_id']),
+                    "source_channel": row['source_channel'],
+                    "created_at": row['committed_at'].isoformat() if row['committed_at'] else None,
+                    "updated_at": metadata.get('updated_at'),
+                    "has_embedding": row['has_embedding'],
+                    "embedding_dims": EMBEDDING_DIMS if row['has_embedding'] else None,
+                    "content_hash": content_hash,
+                    "pinned": metadata.get('pinned', False),
+                    "suppressed": metadata.get('suppressed', False)
+                },
+                "related": related,
+                "governance": {
+                    "suppressed": metadata.get('suppressed', False),
+                    "suppressed_at": metadata.get('suppressed_at'),
+                    "suppressed_reason": metadata.get('suppressed_reason')
+                }
+            }
+        finally:
+            cur.close()
+
+
+@app.post("/admin/memories/{memory_id}/suppress")
+def admin_suppress_memory(memory_id: int, reason: Optional[str] = None, tenant: dict = Depends(get_tenant)):
+    """Suppress a memory (soft delete, reversible)."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memory.suppress", correlation_id=correlation_id, memory_id=memory_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("SELECT id, metadata FROM memory_entries WHERE id = %s", (memory_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            metadata = row['metadata'] or {}
+            metadata['suppressed'] = True
+            metadata['suppressed_at'] = datetime.now(timezone.utc).isoformat()
+            if reason:
+                metadata['suppressed_reason'] = reason
+            
+            cur.execute("""
+                UPDATE memory_entries 
+                SET metadata = %s
+                WHERE id = %s
+            """, (json.dumps(metadata), memory_id))
+            
+            conn.commit()
+            
+            log.info("admin.memory.suppressed", 
+                     correlation_id=correlation_id, 
+                     memory_id=memory_id)
+            
+            metrics.inc("gam_governance_suppress_total")
+            
+            return {
+                "memory_id": memory_id,
+                "status": "suppressed",
+                "suppressed_at": metadata['suppressed_at']
+            }
+        finally:
+            cur.close()
+
+
+@app.post("/admin/memories/{memory_id}/unsuppress")
+def admin_unsuppress_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Unsuppress a memory (restore from soft delete)."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memory.unsuppress", correlation_id=correlation_id, memory_id=memory_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("SELECT id, metadata FROM memory_entries WHERE id = %s", (memory_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            metadata = row['metadata'] or {}
+            metadata['suppressed'] = False
+            metadata['unsuppressed_at'] = datetime.now(timezone.utc).isoformat()
+            
+            cur.execute("""
+                UPDATE memory_entries 
+                SET metadata = %s
+                WHERE id = %s
+            """, (json.dumps(metadata), memory_id))
+            
+            conn.commit()
+            
+            log.info("admin.memory.unsuppressed", 
+                     correlation_id=correlation_id, 
+                     memory_id=memory_id)
+            
+            return {
+                "memory_id": memory_id,
+                "status": "restored"
+            }
+        finally:
+            cur.close()
+
+
+@app.post("/admin/memories/{memory_id}/reindex")
+def admin_reindex_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Regenerate embedding for a memory (async-safe)."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memory.reindex.started", correlation_id=correlation_id, memory_id=memory_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("SELECT id, content, metadata FROM memory_entries WHERE id = %s", (memory_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            # Generate new embedding
+            try:
+                new_embedding = generate_embedding(row['content'], correlation_id)
+            except Exception as e:
+                log.error("admin.memory.reindex.embedding_failed",
+                          correlation_id=correlation_id,
+                          memory_id=memory_id,
+                          error=str(e))
+                return {
+                    "memory_id": memory_id,
+                    "status": "failed",
+                    "error": "Embedding generation failed"
+                }
+            
+            # Update embedding
+            metadata = row['metadata'] or {}
+            metadata['reindexed_at'] = datetime.now(timezone.utc).isoformat()
+            metadata['updated_at'] = datetime.now(timezone.utc).isoformat()
+            
+            cur.execute("""
+                UPDATE memory_entries 
+                SET embedding = %s::vector, metadata = %s
+                WHERE id = %s
+            """, (new_embedding, json.dumps(metadata), memory_id))
+            
+            conn.commit()
+            
+            log.info("admin.memory.reindex.completed", 
+                     correlation_id=correlation_id, 
+                     memory_id=memory_id)
+            
+            metrics.inc("gam_governance_reindex_total")
+            
+            return {
+                "memory_id": memory_id,
+                "status": "reindexed",
+                "reindexed_at": metadata['reindexed_at']
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/stats")
+def admin_stats(tenant: dict = Depends(get_tenant)):
+    """Global stats dashboard."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.stats", correlation_id=correlation_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Total counts
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(CASE WHEN metadata->>'pinned' = 'true' THEN 1 END) as pinned,
+                    COUNT(CASE WHEN metadata->>'suppressed' = 'true' THEN 1 END) as suppressed,
+                    COUNT(CASE WHEN embedding IS NOT NULL THEN 1 END) as embedded
+                FROM memory_entries
+            """)
+            counts = cur.fetchone()
+            
+            # By kind
+            cur.execute("""
+                SELECT memory_kind, COUNT(*) as count
+                FROM memory_entries
+                WHERE metadata->>'suppressed' IS NULL OR metadata->>'suppressed' != 'true'
+                GROUP BY memory_kind
+                ORDER BY count DESC
+            """)
+            by_kind = {row['memory_kind']: row['count'] for row in cur.fetchall()}
+            
+            # Tenant count
+            cur.execute("SELECT COUNT(*) as count FROM tenants")
+            tenant_count = cur.fetchone()['count']
+            
+            # Recent activity (last 24h)
+            cur.execute("""
+                SELECT COUNT(*) as count
+                FROM memory_entries
+                WHERE committed_at > NOW() - INTERVAL '24 hours'
+            """)
+            recent = cur.fetchone()['count']
+            
+            return {
+                "totals": {
+                    "memories": counts['total'],
+                    "pinned": counts['pinned'],
+                    "suppressed": counts['suppressed'],
+                    "embedded": counts['embedded'],
+                    "tenants": tenant_count
+                },
+                "by_kind": by_kind,
+                "activity": {
+                    "last_24h": recent
+                }
+            }
+        finally:
+            cur.close()
+
+
+class AdminSearchRequest(BaseModel):
+    query: str
+    tenant_id: Optional[str] = None
+    limit: int = 10
+    show_scoring: bool = True
+
+@app.post("/admin/search")
+def admin_search(request: AdminSearchRequest, tenant: dict = Depends(get_tenant)):
+    """Debug search with scoring breakdown."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.search", 
+             correlation_id=correlation_id, 
+             query=request.query[:50],
+             tenant_id=request.tenant_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Generate query embedding
+            query_embedding = generate_embedding(request.query, correlation_id)
+            
+            # Build tenant filter
+            tenant_filter = ""
+            params = [query_embedding, query_embedding, query_embedding]
+            if request.tenant_id:
+                tenant_filter = "AND tenant_id = %s"
+                params.append(request.tenant_id)
+            
+            params.append(request.limit)
+            
+            cur.execute(f"""
+                SELECT 
+                    m.id, m.content, m.memory_kind, m.salience_score,
+                    1 - (m.embedding <=> %s::vector) as similarity,
+                    (1 - (m.embedding <=> %s::vector)) * 0.7 + m.salience_score * 0.3 as final_score,
+                    t.name as tenant_name
+                FROM memory_entries m
+                JOIN tenants t ON m.tenant_id = t.id
+                WHERE m.embedding IS NOT NULL
+                  AND (m.metadata->>'suppressed' IS NULL OR m.metadata->>'suppressed' != 'true')
+                  AND 1 - (m.embedding <=> %s::vector) >= 0.2
+                  {tenant_filter}
+                ORDER BY final_score DESC
+                LIMIT %s
+            """, params)
+            
+            results = []
+            for row in cur.fetchall():
+                result = {
+                    "id": row['id'],
+                    "content": row['content'][:200] + "..." if len(row['content']) > 200 else row['content'],
+                    "kind": row['memory_kind'],
+                    "tenant": row['tenant_name']
+                }
+                
+                if request.show_scoring:
+                    result["scoring"] = {
+                        "similarity": round(row['similarity'], 4),
+                        "salience": round(row['salience_score'], 4),
+                        "final_score": round(row['final_score'], 4),
+                        "formula": "final = similarity * 0.7 + salience * 0.3"
+                    }
+                
+                results.append(result)
+            
+            return {
+                "query": request.query,
+                "total": len(results),
+                "attention_weight": ATTENTION_WEIGHT,
+                "results": results
+            }
+        finally:
+            cur.close()
+
 
 if __name__ == "__main__":
     import uvicorn
