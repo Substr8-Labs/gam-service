@@ -1,42 +1,55 @@
 #!/usr/bin/env python3
 """
-GAM Service v2 - Multi-tenant Memory Infrastructure PoC
+GAM Service v2.1 - Multi-tenant Memory Infrastructure with Telemetry
 
-Changes from v1:
-- Connection pooling (fixes 500 errors)
+v2.1 adds:
+- Structured JSON logging
+- Correlation IDs for request tracing
+- Failure taxonomy
+- Ingestion counters (Prometheus-compatible)
+- Health dashboard endpoint
+
+Previous (v2.0):
+- Connection pooling
 - Multi-tenant isolation
-- Canonical memory envelope
 - Attention/salience scoring
 - Idempotent writes
-- Better error handling
 """
 
 import os
 import hashlib
 import json
 import secrets
+import uuid
+import time
 import logging
+import sys
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
+from collections import defaultdict
+from threading import Lock
 
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import execute_values, RealDictCursor
+from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
 from openai import OpenAI
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("gam-service")
+# ============================================================
+# Configuration
+# ============================================================
 
-# Config
+SERVICE_NAME = "gam-service"
+SERVICE_VERSION = "2.1.0"
+
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
 DB_USER = os.getenv("GAM_DB_USER", os.getenv("PGUSER", "gam"))
@@ -47,32 +60,169 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMS = 1536
 
-# Attention scoring config
 DEFAULT_SALIENCE = 0.5
 ATTENTION_WEIGHT = float(os.getenv("GAM_ATTENTION_WEIGHT", "0.3"))
 
-# Connection pool
-db_pool: pool.ThreadedConnectionPool = None
+# ============================================================
+# Failure Taxonomy
+# ============================================================
 
-# FastAPI app
-app = FastAPI(
-    title="GAM Service v2",
-    version="2.0.0",
-    description="Multi-tenant Memory Infrastructure for Agents"
-)
+class ErrorCode:
+    """Canonical error codes for failure taxonomy."""
+    VALIDATION_ERROR = "validation_error"
+    AUTH_ERROR = "auth_error"
+    RATE_LIMIT = "rate_limit_exceeded"
+    DB_ERROR = "db_error"
+    DB_TIMEOUT = "db_timeout"
+    EMBEDDING_ERROR = "embedding_error"
+    SEARCH_ERROR = "search_error"
+    EXTERNAL_ERROR = "external_dependency_error"
+    UNKNOWN_ERROR = "unknown_error"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================
+# Structured Logging
+# ============================================================
 
+class StructuredLogger:
+    """JSON structured logger for telemetry."""
+    
+    def __init__(self, name: str):
+        self.name = name
+        self.logger = logging.getLogger(name)
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+    
+    def _emit(self, level: str, event_type: str, **kwargs):
+        """Emit structured log event."""
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": level,
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
+            "event_type": event_type,
+            **kwargs
+        }
+        self.logger.log(getattr(logging, level), json.dumps(event))
+    
+    def info(self, event_type: str, **kwargs):
+        self._emit("INFO", event_type, **kwargs)
+    
+    def error(self, event_type: str, **kwargs):
+        self._emit("ERROR", event_type, **kwargs)
+    
+    def warning(self, event_type: str, **kwargs):
+        self._emit("WARNING", event_type, **kwargs)
+
+log = StructuredLogger(SERVICE_NAME)
+
+# ============================================================
+# Metrics Counters (Thread-safe)
+# ============================================================
+
+class MetricsCollector:
+    """Simple in-memory metrics collector for Prometheus-style export."""
+    
+    def __init__(self):
+        self._lock = Lock()
+        self._counters: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._histograms: Dict[str, List[float]] = defaultdict(list)
+        self._start_time = time.time()
+    
+    def inc(self, name: str, labels: Dict[str, str] = None, value: int = 1):
+        """Increment a counter."""
+        labels = labels or {}
+        label_key = json.dumps(labels, sort_keys=True)
+        with self._lock:
+            self._counters[name][label_key] += value
+    
+    def observe(self, name: str, value: float, labels: Dict[str, str] = None):
+        """Record a histogram observation."""
+        labels = labels or {}
+        label_key = json.dumps(labels, sort_keys=True)
+        with self._lock:
+            self._histograms[f"{name}:{label_key}"].append(value)
+    
+    def export_prometheus(self) -> str:
+        """Export metrics in Prometheus text format."""
+        lines = [
+            f"# GAM Service Metrics",
+            f"# Generated at {datetime.now(timezone.utc).isoformat()}",
+            f"gam_service_uptime_seconds {time.time() - self._start_time:.0f}",
+            ""
+        ]
+        
+        with self._lock:
+            # Export counters
+            for name, label_values in self._counters.items():
+                lines.append(f"# TYPE {name} counter")
+                for label_key, value in label_values.items():
+                    labels = json.loads(label_key) if label_key != "{}" else {}
+                    label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+                    if label_str:
+                        lines.append(f"{name}{{{label_str}}} {value}")
+                    else:
+                        lines.append(f"{name} {value}")
+            
+            # Export histogram summaries
+            for name_key, values in self._histograms.items():
+                name, label_key = name_key.rsplit(":", 1)
+                if values:
+                    labels = json.loads(label_key) if label_key != "{}" else {}
+                    label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+                    prefix = f"{name}{{{label_str}}}" if label_str else name
+                    lines.append(f"# TYPE {name} summary")
+                    lines.append(f"{prefix}_count {len(values)}")
+                    lines.append(f"{prefix}_sum {sum(values):.2f}")
+                    if values:
+                        sorted_values = sorted(values)
+                        lines.append(f"{prefix}_p50 {sorted_values[len(values)//2]:.2f}")
+                        lines.append(f"{prefix}_p95 {sorted_values[int(len(values)*0.95)]:.2f}")
+        
+        return "\n".join(lines)
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """Get metrics summary as JSON."""
+        with self._lock:
+            summary = {
+                "uptime_seconds": int(time.time() - self._start_time),
+                "counters": {},
+                "histograms": {}
+            }
+            
+            for name, label_values in self._counters.items():
+                summary["counters"][name] = {}
+                for label_key, value in label_values.items():
+                    labels = json.loads(label_key) if label_key != "{}" else {}
+                    key = str(labels) if labels else "total"
+                    summary["counters"][name][key] = value
+            
+            for name_key, values in self._histograms.items():
+                name, _ = name_key.rsplit(":", 1)
+                if name not in summary["histograms"]:
+                    summary["histograms"][name] = {"count": 0, "sum": 0}
+                summary["histograms"][name]["count"] += len(values)
+                summary["histograms"][name]["sum"] += sum(values)
+            
+            return summary
+
+metrics = MetricsCollector()
+
+# ============================================================
+# Correlation ID
+# ============================================================
+
+def generate_correlation_id() -> str:
+    """Generate unique correlation ID for request tracing."""
+    return f"gam-{uuid.uuid4().hex[:12]}"
 
 # ============================================================
 # Database Connection Pooling
 # ============================================================
+
+db_pool: pool.ThreadedConnectionPool = None
 
 def init_db_pool():
     """Initialize connection pool on startup."""
@@ -88,43 +238,70 @@ def init_db_pool():
             dbname=DB_NAME,
             connect_timeout=10
         )
-        logger.info(f"Database pool initialized: {DB_HOST}:{DB_PORT}/{DB_NAME}")
+        log.info("db.pool.initialized", host=DB_HOST, port=DB_PORT, database=DB_NAME)
     except Exception as e:
-        logger.error(f"Failed to initialize DB pool: {e}")
+        log.error("db.pool.failed", error=str(e), error_code=ErrorCode.DB_ERROR)
         raise
 
-
 @contextmanager
-def get_db():
+def get_db(correlation_id: str = None):
     """Get connection from pool with automatic cleanup."""
     conn = None
     try:
         conn = db_pool.getconn()
         register_vector(conn)
         yield conn
+    except psycopg2.OperationalError as e:
+        if conn:
+            conn.rollback()
+        log.error("db.connection.error", 
+                  correlation_id=correlation_id,
+                  error=str(e), 
+                  error_code=ErrorCode.DB_ERROR)
+        metrics.inc("gam_db_error_total", {"error_code": ErrorCode.DB_ERROR})
+        raise
     except Exception as e:
         if conn:
             conn.rollback()
-        logger.error(f"Database error: {e}")
+        log.error("db.error", 
+                  correlation_id=correlation_id,
+                  error=str(e), 
+                  error_code=ErrorCode.UNKNOWN_ERROR)
         raise
     finally:
         if conn:
             db_pool.putconn(conn)
 
+# ============================================================
+# FastAPI App
+# ============================================================
+
+app = FastAPI(
+    title="GAM Service",
+    version=SERVICE_VERSION,
+    description="Multi-tenant Memory Infrastructure for Agents"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 async def startup():
     init_db_pool()
-    # Run migrations
     with get_db() as conn:
         run_migrations(conn)
-
+    log.info("service.started", version=SERVICE_VERSION)
 
 @app.on_event("shutdown")
 async def shutdown():
     if db_pool:
         db_pool.closeall()
-
+    log.info("service.stopped")
 
 # ============================================================
 # Migrations
@@ -134,7 +311,6 @@ def run_migrations(conn):
     """Run schema migrations."""
     cur = conn.cursor()
     try:
-        # Check if tenants table exists
         cur.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -142,9 +318,8 @@ def run_migrations(conn):
             )
         """)
         if not cur.fetchone()[0]:
-            logger.info("Running v2 migrations...")
+            log.info("db.migrations.running")
             
-            # Create tenants table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tenants (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -155,7 +330,6 @@ def run_migrations(conn):
                 )
             """)
             
-            # Add columns to memory_entries if they don't exist
             migrations = [
                 "ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS tenant_id UUID",
                 "ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS source_channel VARCHAR(50) DEFAULT 'api'",
@@ -171,16 +345,14 @@ def run_migrations(conn):
                 try:
                     cur.execute(sql)
                 except Exception as e:
-                    logger.warning(f"Migration warning: {e}")
+                    log.warning("db.migration.warning", sql=sql[:50], error=str(e))
             
-            # Create default tenant for Ada (backwards compatibility)
             cur.execute("""
                 INSERT INTO tenants (id, name, api_key)
                 VALUES ('00000000-0000-0000-0000-000000000001', 'ada', 'ada-legacy-key')
                 ON CONFLICT (id) DO NOTHING
             """)
             
-            # Update existing entries to default tenant
             cur.execute("""
                 UPDATE memory_entries 
                 SET tenant_id = '00000000-0000-0000-0000-000000000001'
@@ -188,11 +360,9 @@ def run_migrations(conn):
             """)
             
             conn.commit()
-            logger.info("Migrations complete")
-        
+            log.info("db.migrations.complete")
     finally:
         cur.close()
-
 
 # ============================================================
 # OpenAI Client
@@ -201,7 +371,6 @@ def run_migrations(conn):
 _openai_client = None
 
 def get_openai_client():
-    """Singleton OpenAI client."""
     global _openai_client
     if _openai_client is None:
         if not OPENAI_API_KEY:
@@ -209,79 +378,52 @@ def get_openai_client():
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
 
-
-def generate_embedding(text: str) -> List[float]:
+def generate_embedding(text: str, correlation_id: str = None) -> List[float]:
     """Generate embedding using OpenAI."""
+    start_time = time.time()
     client = get_openai_client()
-    # Truncate to avoid token limits
     text = text[:8000]
-    response = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=text
-    )
-    return response.data[0].embedding
-
-
-# ============================================================
-# Authentication
-# ============================================================
-
-async def get_tenant(x_api_key: str = Header(None, alias="X-API-Key")):
-    """Validate API key and return tenant."""
-    if not x_api_key:
-        # Allow legacy agent_id parameter for backwards compatibility
-        return None
     
-    with get_db() as conn:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM tenants WHERE api_key = %s", (x_api_key,))
-        tenant = cur.fetchone()
-        cur.close()
-        
-        if not tenant:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        return tenant
-
+    try:
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
+        )
+        duration_ms = int((time.time() - start_time) * 1000)
+        metrics.observe("gam_embedding_duration_ms", duration_ms)
+        metrics.inc("gam_embedding_generated_total")
+        return response.data[0].embedding
+    except Exception as e:
+        log.error("embedding.failed", 
+                  correlation_id=correlation_id,
+                  error=str(e),
+                  error_code=ErrorCode.EMBEDDING_ERROR)
+        metrics.inc("gam_embedding_error_total", {"error_code": ErrorCode.EMBEDDING_ERROR})
+        raise
 
 # ============================================================
 # Attention Scoring
 # ============================================================
 
 def compute_salience(content: str, metadata: dict = None) -> float:
-    """
-    Compute salience score for a memory entry.
-    
-    Based on whitepaper heuristics:
-    - 0.0-0.3: Low importance (routine queries, transient details)
-    - 0.4-0.6: Medium importance (standard task completion)
-    - 0.7-1.0: High importance (strategic decisions, emotional moments)
-    """
     score = DEFAULT_SALIENCE
     content_lower = content.lower()
     
-    # High importance signals
     high_signals = [
         'decided', 'decision', 'strategy', 'strategic',
         'important', 'critical', 'milestone', 'breakthrough',
         'agreed', 'confirmed', 'committed', 'promise',
-        'learned', 'realized', 'insight', 'discovered',
-        'remember this', 'never forget', 'key point'
+        'learned', 'realized', 'insight', 'discovered'
     ]
     
-    # Medium importance signals
     medium_signals = [
         'completed', 'finished', 'shipped', 'deployed',
         'meeting', 'discussed', 'reviewed', 'feedback',
         'todo', 'task', 'action item', 'follow up'
     ]
     
-    # Low importance signals (demote)
-    low_signals = [
-        'heartbeat', 'health check', 'status ok',
-        'routine', 'daily', 'weekly'
-    ]
+    low_signals = ['heartbeat', 'health check', 'status ok', 'routine', 'daily']
     
-    # Check signals
     for signal in high_signals:
         if signal in content_lower:
             score = min(1.0, score + 0.15)
@@ -294,7 +436,6 @@ def compute_salience(content: str, metadata: dict = None) -> float:
         if signal in content_lower:
             score = max(0.1, score - 0.2)
     
-    # Metadata boosts
     if metadata:
         if metadata.get('pinned'):
             score = 1.0
@@ -303,6 +444,24 @@ def compute_salience(content: str, metadata: dict = None) -> float:
     
     return round(score, 2)
 
+# ============================================================
+# Authentication
+# ============================================================
+
+async def get_tenant(x_api_key: str = Header(None, alias="X-API-Key")):
+    if not x_api_key:
+        return None
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM tenants WHERE api_key = %s", (x_api_key,))
+        tenant = cur.fetchone()
+        cur.close()
+        
+        if not tenant:
+            metrics.inc("gam_auth_error_total")
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return tenant
 
 # ============================================================
 # Models
@@ -311,13 +470,11 @@ def compute_salience(content: str, metadata: dict = None) -> float:
 class TenantCreate(BaseModel):
     name: str
 
-
 class TenantResponse(BaseModel):
     id: str
     name: str
     api_key: str
     created_at: datetime
-
 
 class MemoryEntry(BaseModel):
     content: str
@@ -326,8 +483,7 @@ class MemoryEntry(BaseModel):
     memory_kind: str = "note"
     session_id: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
-    salience_score: Optional[float] = None  # Auto-computed if not provided
-
+    salience_score: Optional[float] = None
 
 class BatchEntry(BaseModel):
     file_path: str = "api"
@@ -338,20 +494,16 @@ class BatchEntry(BaseModel):
     memory_kind: str = "note"
     metadata: dict = Field(default_factory=dict)
 
-
 class BatchIngestRequest(BaseModel):
-    agent_id: str  # Kept for backwards compatibility
+    agent_id: str
     entries: List[BatchEntry]
 
-
 class SearchRequest(BaseModel):
-    agent_id: Optional[str] = None  # Legacy, use X-API-Key instead
+    agent_id: Optional[str] = None
     query: str
     limit: int = 10
     min_similarity: float = 0.1
-    include_scores: bool = False  # Return both similarity and salience
-    attention_weight: Optional[float] = None  # Override default
-
+    attention_weight: Optional[float] = None
 
 class SearchResult(BaseModel):
     id: int
@@ -364,36 +516,79 @@ class SearchResult(BaseModel):
     source_channel: str = "api"
     memory_kind: str = "note"
 
-
 # ============================================================
 # Endpoints
 # ============================================================
 
 @app.get("/health")
 def health():
-    """Health check with pool status."""
+    """Health check with telemetry status."""
+    correlation_id = generate_correlation_id()
     try:
-        with get_db() as conn:
+        with get_db(correlation_id) as conn:
             cur = conn.cursor()
             cur.execute("SELECT 1")
             cur.close()
         return {
             "status": "healthy",
             "database": "connected",
-            "version": "2.0.0",
+            "version": SERVICE_VERSION,
             "pool_size": db_pool.maxconn if db_pool else 0
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        log.error("health.check.failed", correlation_id=correlation_id, error=str(e))
         return {"status": "unhealthy", "error": str(e)}
 
+@app.get("/metrics", response_class=PlainTextResponse)
+def get_metrics():
+    """Prometheus-compatible metrics endpoint."""
+    return metrics.export_prometheus()
+
+@app.get("/dashboard")
+def get_dashboard():
+    """Ingestion health dashboard data."""
+    summary = metrics.get_summary()
+    
+    counters = summary.get("counters", {})
+    ingest = counters.get("gam_ingest_attempt_total", {})
+    success = counters.get("gam_ingest_success_total", {})
+    failures = counters.get("gam_ingest_failure_total", {})
+    
+    total_attempted = sum(ingest.values()) if ingest else 0
+    total_succeeded = sum(success.values()) if success else 0
+    total_failed = sum(failures.values()) if failures else 0
+    
+    success_rate = (total_succeeded / total_attempted * 100) if total_attempted > 0 else 100
+    
+    return {
+        "version": SERVICE_VERSION,
+        "uptime_seconds": summary.get("uptime_seconds", 0),
+        "ingestion": {
+            "attempted": total_attempted,
+            "succeeded": total_succeeded,
+            "failed": total_failed,
+            "success_rate_percent": round(success_rate, 1),
+            "failures_by_reason": failures
+        },
+        "search": {
+            "total": counters.get("gam_search_total", {}).get("total", 0),
+            "empty_results": counters.get("gam_search_empty_total", {}).get("total", 0)
+        },
+        "embeddings": {
+            "generated": counters.get("gam_embedding_generated_total", {}).get("total", 0),
+            "errors": counters.get("gam_embedding_error_total", {}).get("total", 0)
+        }
+    }
 
 @app.post("/tenants", response_model=TenantResponse)
 def create_tenant(request: TenantCreate):
     """Register a new tenant."""
+    correlation_id = generate_correlation_id()
     api_key = secrets.token_urlsafe(32)
     
-    with get_db() as conn:
+    log.info("tenant.create.started", correlation_id=correlation_id, name=request.name)
+    
+    with get_db(correlation_id) as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
             cur.execute("""
@@ -403,18 +598,29 @@ def create_tenant(request: TenantCreate):
             """, (request.name, api_key))
             tenant = cur.fetchone()
             conn.commit()
+            
+            log.info("tenant.create.succeeded", 
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant['id']),
+                     name=tenant['name'])
+            metrics.inc("gam_tenant_created_total")
+            
             return TenantResponse(**tenant)
         except Exception as e:
             conn.rollback()
+            log.error("tenant.create.failed",
+                      correlation_id=correlation_id,
+                      error=str(e),
+                      error_code=ErrorCode.DB_ERROR)
             raise HTTPException(status_code=400, detail=str(e))
         finally:
             cur.close()
 
-
 @app.get("/tenants/{tenant_id}")
 def get_tenant_info(tenant_id: str, tenant: dict = Depends(get_tenant)):
-    """Get tenant info (requires auth)."""
-    with get_db() as conn:
+    """Get tenant info."""
+    correlation_id = generate_correlation_id()
+    with get_db(correlation_id) as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("SELECT id, name, created_at, config FROM tenants WHERE id = %s", (tenant_id,))
         result = cur.fetchone()
@@ -423,37 +629,47 @@ def get_tenant_info(tenant_id: str, tenant: dict = Depends(get_tenant)):
             raise HTTPException(status_code=404, detail="Tenant not found")
         return result
 
-
 @app.post("/memory")
 def store_memory(entry: MemoryEntry, tenant: dict = Depends(get_tenant)):
     """Store a single memory entry."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
+    
     if not tenant:
+        metrics.inc("gam_auth_error_total")
         raise HTTPException(status_code=401, detail="API key required")
     
     content_hash = hashlib.sha256(entry.content.encode()).hexdigest()
     
-    with get_db() as conn:
+    log.info("memory.store.started",
+             correlation_id=correlation_id,
+             tenant_id=str(tenant['id']),
+             content_length=len(entry.content),
+             memory_kind=entry.memory_kind)
+    
+    metrics.inc("gam_ingest_attempt_total", {"tenant": tenant['name'], "kind": entry.memory_kind})
+    
+    with get_db(correlation_id) as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
-            # Check for duplicate (idempotent)
+            # Check for duplicate
             cur.execute(
                 "SELECT id FROM memory_entries WHERE content_hash = %s AND tenant_id = %s",
                 (content_hash, tenant['id'])
             )
             existing = cur.fetchone()
             if existing:
+                duration_ms = int((time.time() - start_time) * 1000)
+                log.info("memory.store.duplicate",
+                         correlation_id=correlation_id,
+                         memory_id=existing['id'],
+                         duration_ms=duration_ms)
                 return {"id": existing['id'], "status": "duplicate"}
             
-            # Compute salience if not provided
             salience = entry.salience_score or compute_salience(entry.content, entry.metadata)
-            
-            # Generate embedding
-            embedding = generate_embedding(entry.content)
-            
-            # Generate commit hash for tracking
+            embedding = generate_embedding(entry.content, correlation_id)
             commit_hash = f"mem-{content_hash[:16]}"
             
-            # Insert
             cur.execute("""
                 INSERT INTO memory_entries 
                 (tenant_id, agent_id, commit_hash, file_path, content, content_hash, 
@@ -470,47 +686,65 @@ def store_memory(entry: MemoryEntry, tenant: dict = Depends(get_tenant)):
             result = cur.fetchone()
             conn.commit()
             
-            return {
-                "id": result['id'],
-                "status": "created",
-                "salience_score": salience
-            }
+            duration_ms = int((time.time() - start_time) * 1000)
+            log.info("memory.store.succeeded",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant['id']),
+                     memory_id=result['id'],
+                     salience_score=salience,
+                     duration_ms=duration_ms)
+            
+            metrics.inc("gam_ingest_success_total", {"tenant": tenant['name'], "kind": entry.memory_kind})
+            metrics.observe("gam_ingest_duration_ms", duration_ms, {"tenant": tenant['name']})
+            
+            return {"id": result['id'], "status": "created", "salience_score": salience}
             
         except Exception as e:
             conn.rollback()
-            logger.error(f"Store memory failed: {e}")
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_code = ErrorCode.DB_ERROR if "psycopg" in str(type(e)) else ErrorCode.UNKNOWN_ERROR
+            
+            log.error("memory.store.failed",
+                      correlation_id=correlation_id,
+                      tenant_id=str(tenant['id']),
+                      error=str(e),
+                      error_code=error_code,
+                      duration_ms=duration_ms)
+            
+            metrics.inc("gam_ingest_failure_total", {"tenant": tenant['name'], "error_code": error_code})
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             cur.close()
 
-
 @app.post("/batch")
 def batch_ingest(request: BatchIngestRequest):
-    """
-    Batch ingest entries (backwards compatible).
-    Uses agent_id to find tenant, or creates entries under legacy tenant.
-    """
-    with get_db() as conn:
+    """Batch ingest entries."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
+    
+    log.info("batch.ingest.started",
+             correlation_id=correlation_id,
+             agent_id=request.agent_id,
+             entry_count=len(request.entries))
+    
+    with get_db(correlation_id) as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         try:
-            # Find tenant by agent_id (backwards compat)
             cur.execute("SELECT id FROM tenants WHERE name = %s", (request.agent_id,))
             tenant = cur.fetchone()
-            
-            if not tenant:
-                # Use legacy Ada tenant
-                tenant_id = '00000000-0000-0000-0000-000000000001'
-            else:
-                tenant_id = tenant['id']
+            tenant_id = tenant['id'] if tenant else '00000000-0000-0000-0000-000000000001'
             
             inserted = 0
             duplicates = 0
+            failed = 0
+            failure_reasons = defaultdict(int)
             
             for entry in request.entries:
+                metrics.inc("gam_ingest_attempt_total", {"tenant": request.agent_id, "kind": entry.memory_kind})
+                
                 content_hash = hashlib.sha256(entry.content.encode()).hexdigest()
                 
-                # Check for duplicate (idempotent)
                 cur.execute(
                     "SELECT 1 FROM memory_entries WHERE content_hash = %s AND tenant_id = %s",
                     (content_hash, tenant_id)
@@ -519,84 +753,120 @@ def batch_ingest(request: BatchIngestRequest):
                     duplicates += 1
                     continue
                 
-                # Compute salience
                 salience = compute_salience(entry.content, entry.metadata)
                 
-                # Generate embedding
                 try:
-                    embedding = generate_embedding(entry.content)
+                    embedding = generate_embedding(entry.content, correlation_id)
                 except Exception as e:
-                    logger.error(f"Embedding failed: {e}")
+                    failed += 1
+                    failure_reasons[ErrorCode.EMBEDDING_ERROR] += 1
+                    metrics.inc("gam_ingest_failure_total", 
+                               {"tenant": request.agent_id, "error_code": ErrorCode.EMBEDDING_ERROR})
                     continue
                 
                 commit_hash = entry.commit_hash or f"batch-{hash(entry.content) & 0xffffffff:08x}"
                 committed_at = entry.committed_at or datetime.now(timezone.utc).isoformat()
                 
-                cur.execute("""
-                    INSERT INTO memory_entries 
-                    (tenant_id, agent_id, commit_hash, file_path, content, content_hash,
-                     embedding, source_channel, memory_kind, salience_score, 
-                     metadata, committed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    tenant_id, request.agent_id, commit_hash, entry.file_path,
-                    entry.content, content_hash, embedding, entry.source_channel,
-                    entry.memory_kind, salience, json.dumps(entry.metadata), committed_at
-                ))
-                inserted += 1
-                
-                # Commit every 10 to avoid large transactions
-                if inserted % 10 == 0:
-                    conn.commit()
+                try:
+                    cur.execute("""
+                        INSERT INTO memory_entries 
+                        (tenant_id, agent_id, commit_hash, file_path, content, content_hash,
+                         embedding, source_channel, memory_kind, salience_score, 
+                         metadata, committed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        tenant_id, request.agent_id, commit_hash, entry.file_path,
+                        entry.content, content_hash, embedding, entry.source_channel,
+                        entry.memory_kind, salience, json.dumps(entry.metadata), committed_at
+                    ))
+                    inserted += 1
+                    metrics.inc("gam_ingest_success_total", {"tenant": request.agent_id, "kind": entry.memory_kind})
+                    
+                    if inserted % 10 == 0:
+                        conn.commit()
+                        
+                except Exception as e:
+                    failed += 1
+                    failure_reasons[ErrorCode.DB_ERROR] += 1
+                    metrics.inc("gam_ingest_failure_total",
+                               {"tenant": request.agent_id, "error_code": ErrorCode.DB_ERROR})
             
             conn.commit()
-            logger.info(f"Batch ingest: {inserted} inserted, {duplicates} duplicates")
-            return {"inserted": inserted, "duplicates": duplicates, "total": len(request.entries)}
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            status = "success" if failed == 0 else ("partial_success" if inserted > 0 else "failed")
+            
+            log.info("batch.ingest.completed",
+                     correlation_id=correlation_id,
+                     agent_id=request.agent_id,
+                     status=status,
+                     attempted=len(request.entries),
+                     inserted=inserted,
+                     duplicates=duplicates,
+                     failed=failed,
+                     failure_reasons=dict(failure_reasons),
+                     duration_ms=duration_ms)
+            
+            metrics.observe("gam_batch_duration_ms", duration_ms, {"tenant": request.agent_id})
+            
+            return {
+                "status": status,
+                "inserted": inserted, 
+                "duplicates": duplicates, 
+                "failed": failed,
+                "total": len(request.entries),
+                "failure_reasons": dict(failure_reasons) if failure_reasons else None
+            }
             
         except Exception as e:
             conn.rollback()
-            logger.error(f"Batch ingest failed: {e}")
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            log.error("batch.ingest.failed",
+                      correlation_id=correlation_id,
+                      agent_id=request.agent_id,
+                      error=str(e),
+                      error_code=ErrorCode.DB_ERROR,
+                      duration_ms=duration_ms)
+            
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             cur.close()
 
-
 @app.post("/search", response_model=List[SearchResult])
 def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
-    """
-    Hybrid search with attention ranking.
+    """Hybrid search with attention ranking."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
     
-    final_score = similarity * (1 - α) + salience * α
-    """
-    with get_db() as conn:
+    with get_db(correlation_id) as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         try:
-            # Determine tenant
             if tenant:
                 tenant_id = tenant['id']
             elif request.agent_id:
-                # Legacy: find by agent_id
                 cur.execute("SELECT id FROM tenants WHERE name = %s", (request.agent_id,))
                 t = cur.fetchone()
                 tenant_id = t['id'] if t else '00000000-0000-0000-0000-000000000001'
             else:
                 raise HTTPException(status_code=400, detail="agent_id or API key required")
             
-            # Generate query embedding
-            query_embedding = generate_embedding(request.query)
+            log.info("search.started",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant_id),
+                     query_length=len(request.query),
+                     limit=request.limit)
             
-            # Search with hybrid scoring
+            metrics.inc("gam_search_total", {"tenant": request.agent_id or "api"})
+            
+            query_embedding = generate_embedding(request.query, correlation_id)
             attention_weight = request.attention_weight or ATTENTION_WEIGHT
             
             cur.execute("""
                 SELECT 
-                    id,
-                    content,
-                    file_path,
-                    committed_at,
-                    source_channel,
-                    memory_kind,
+                    id, content, file_path, committed_at,
+                    source_channel, memory_kind,
                     COALESCE(salience_score, 0.5) as salience_score,
                     1 - (embedding <=> %s::vector) as similarity
                 FROM memory_entries
@@ -606,17 +876,12 @@ def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """, (
-                query_embedding,
-                tenant_id,
-                query_embedding,
-                request.min_similarity,
-                query_embedding,
-                request.limit * 2  # Fetch more for reranking
+                query_embedding, tenant_id, query_embedding,
+                request.min_similarity, query_embedding, request.limit * 2
             ))
             
             rows = cur.fetchall()
             
-            # Compute final scores and rerank
             results = []
             for row in rows:
                 similarity = row['similarity']
@@ -635,23 +900,33 @@ def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
                     final_score=round(final_score, 4)
                 ))
             
-            # Sort by final score and limit
             results.sort(key=lambda x: x.final_score, reverse=True)
             results = results[:request.limit]
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            if not results:
+                metrics.inc("gam_search_empty_total", {"tenant": request.agent_id or "api"})
+            
+            log.info("search.completed",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant_id),
+                     result_count=len(results),
+                     duration_ms=duration_ms)
+            
+            metrics.observe("gam_search_duration_ms", duration_ms, {"tenant": request.agent_id or "api"})
             
             return results
             
         finally:
             cur.close()
 
-
 @app.get("/stats")
-def get_stats(
-    agent_id: str = Query(None),
-    tenant: dict = Depends(get_tenant)
-):
+def get_stats(agent_id: str = Query(None), tenant: dict = Depends(get_tenant)):
     """Get memory stats for a tenant/agent."""
-    with get_db() as conn:
+    correlation_id = generate_correlation_id()
+    
+    with get_db(correlation_id) as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         try:
@@ -689,7 +964,6 @@ def get_stats(
         finally:
             cur.close()
 
-
 @app.get("/debug/embedding-status")
 def embedding_status(agent_id: str = "ada"):
     """Debug endpoint to check embedding status."""
@@ -716,13 +990,10 @@ def embedding_status(agent_id: str = "ada"):
         finally:
             cur.close()
 
-
-# Legacy endpoint compatibility
 @app.post("/index")
 def index_repo():
-    """Placeholder for git repo indexing (not in PoC)."""
+    """Placeholder for git repo indexing."""
     return {"status": "not_implemented", "message": "Use /batch or /memory for direct ingestion"}
-
 
 if __name__ == "__main__":
     import uvicorn
