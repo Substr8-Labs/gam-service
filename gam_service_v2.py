@@ -450,16 +450,19 @@ def store_memory(entry: MemoryEntry, tenant: dict = Depends(get_tenant)):
             # Generate embedding
             embedding = generate_embedding(entry.content)
             
+            # Generate commit hash for tracking
+            commit_hash = f"mem-{content_hash[:16]}"
+            
             # Insert
             cur.execute("""
                 INSERT INTO memory_entries 
-                (tenant_id, agent_id, file_path, content, content_hash, 
+                (tenant_id, agent_id, commit_hash, file_path, content, content_hash, 
                  embedding, source_channel, memory_kind, session_id, 
                  salience_score, metadata, committed_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING id
             """, (
-                tenant['id'], tenant['name'], entry.file_path, entry.content,
+                tenant['id'], tenant['name'], commit_hash, entry.file_path, entry.content,
                 content_hash, embedding, entry.source_channel, entry.memory_kind,
                 entry.session_id, salience, json.dumps(entry.metadata)
             ))
