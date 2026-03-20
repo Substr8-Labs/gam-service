@@ -1209,9 +1209,9 @@ def get_related(memory_id: int, limit: int = 5, tenant: dict = Depends(get_tenan
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         try:
-            # Get source memory
+            # Get source memory (convert embedding to list for reuse)
             cur.execute("""
-                SELECT id, content, memory_kind, embedding, salience_score
+                SELECT id, content, memory_kind, embedding::text, salience_score
                 FROM memory_entries 
                 WHERE id = %s AND tenant_id = %s
             """, (memory_id, tenant['id']))
@@ -1223,20 +1223,22 @@ def get_related(memory_id: int, limit: int = 5, tenant: dict = Depends(get_tenan
             if not source['embedding']:
                 raise HTTPException(status_code=400, detail="Memory has no embedding")
             
-            # Find related by semantic similarity
+            # Find related by semantic similarity using subquery
             cur.execute("""
+                WITH source AS (
+                    SELECT embedding FROM memory_entries WHERE id = %s
+                )
                 SELECT 
-                    id, content, memory_kind, salience_score,
-                    1 - (embedding <=> %s::vector) as similarity
-                FROM memory_entries
-                WHERE tenant_id = %s
-                  AND id != %s
-                  AND embedding IS NOT NULL
-                  AND 1 - (embedding <=> %s::vector) >= 0.3
-                ORDER BY embedding <=> %s::vector
+                    m.id, m.content, m.memory_kind, m.salience_score,
+                    1 - (m.embedding <=> source.embedding) as similarity
+                FROM memory_entries m, source
+                WHERE m.tenant_id = %s
+                  AND m.id != %s
+                  AND m.embedding IS NOT NULL
+                  AND 1 - (m.embedding <=> source.embedding) >= 0.3
+                ORDER BY m.embedding <=> source.embedding
                 LIMIT %s
-            """, (source['embedding'], tenant['id'], memory_id, 
-                  source['embedding'], source['embedding'], limit))
+            """, (memory_id, tenant['id'], memory_id, limit))
             
             related = []
             for row in cur.fetchall():
