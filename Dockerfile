@@ -1,19 +1,13 @@
 FROM python:3.11-slim
 
-# Force rebuild on every deploy
-ARG CACHEBUST=1
-
 WORKDIR /app
 
-# Install git for GitPython
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY gam_service.py .
+# Copy app
+COPY gam_service_v2.py ./gam_service.py
 
-ENV PORT=8091
-EXPOSE 8091
-
+# Run
 CMD ["python", "gam_service.py"]
