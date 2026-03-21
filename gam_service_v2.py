@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.3.0"
+SERVICE_VERSION = "2.4.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
@@ -1617,10 +1617,32 @@ def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
                     "suppressed": metadata.get('suppressed', False),
                     "suppressed_at": metadata.get('suppressed_at'),
                     "suppressed_reason": metadata.get('suppressed_reason')
-                }
+                },
+                "entities": get_memory_entities_internal(cur, memory_id, row['tenant_id'])
             }
         finally:
             cur.close()
+
+
+def get_memory_entities_internal(cur, memory_id: int, tenant_id) -> List[dict]:
+    """Get entities for a memory (internal helper)."""
+    cur.execute("""
+        SELECT id, entity_type, entity_value, confidence, metadata
+        FROM entities
+        WHERE memory_id = %s AND tenant_id = %s
+        ORDER BY confidence DESC
+    """, (memory_id, tenant_id))
+    
+    entities = []
+    for row in cur.fetchall():
+        entities.append({
+            "id": row['id'],
+            "type": row['entity_type'],
+            "value": row['entity_value'],
+            "confidence": row['confidence'],
+            "excerpt": row['metadata'].get('excerpt') if row['metadata'] else None
+        })
+    return entities
 
 
 @app.post("/admin/memories/{memory_id}/suppress")
@@ -1914,6 +1936,176 @@ def admin_search(request: AdminSearchRequest, tenant: dict = Depends(get_tenant)
                 "total": len(results),
                 "attention_weight": ATTENTION_WEIGHT,
                 "results": results
+            }
+        finally:
+            cur.close()
+
+
+# ============================================================
+# Entity Endpoints (Milestone D.2)
+# ============================================================
+
+@app.get("/memory/{memory_id}/entities")
+def get_memory_entities(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Get extracted entities for a memory."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("""
+                SELECT e.*, m.content as memory_preview
+                FROM entities e
+                JOIN memory_entries m ON e.memory_id = m.id
+                WHERE e.memory_id = %s AND e.tenant_id = %s
+                ORDER BY e.confidence DESC
+            """, (memory_id, tenant['id']))
+            
+            entities = []
+            memory_preview = None
+            for row in cur.fetchall():
+                memory_preview = row['memory_preview'][:200] if row['memory_preview'] else None
+                entities.append({
+                    "id": row['id'],
+                    "type": row['entity_type'],
+                    "value": row['entity_value'],
+                    "confidence": row['confidence'],
+                    "excerpt": row['metadata'].get('excerpt') if row['metadata'] else None,
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                })
+            
+            return {
+                "memory_id": memory_id,
+                "memory_preview": memory_preview,
+                "entities": entities,
+                "count": len(entities)
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/entities")
+def admin_list_entities(
+    entity_type: Optional[str] = None,
+    value: Optional[str] = None,
+    memory_id: Optional[int] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = 0,
+    tenant: dict = Depends(get_tenant)
+):
+    """List entities with filters (admin)."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            where_clauses = []
+            params = []
+            
+            if entity_type:
+                where_clauses.append("e.entity_type = %s")
+                params.append(entity_type)
+            
+            if value:
+                where_clauses.append("e.entity_value ILIKE %s")
+                params.append(f"%{value}%")
+            
+            if memory_id:
+                where_clauses.append("e.memory_id = %s")
+                params.append(memory_id)
+            
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+            
+            cur.execute(f"SELECT COUNT(*) FROM entities e WHERE {where_sql}", params)
+            total = cur.fetchone()['count']
+            
+            cur.execute(f"""
+                SELECT e.*, m.content as memory_preview, t.name as tenant_name
+                FROM entities e
+                JOIN memory_entries m ON e.memory_id = m.id
+                JOIN tenants t ON e.tenant_id = t.id
+                WHERE {where_sql}
+                ORDER BY e.created_at DESC
+                LIMIT %s OFFSET %s
+            """, params + [limit, offset])
+            
+            entities = []
+            for row in cur.fetchall():
+                entities.append({
+                    "id": row['id'],
+                    "memory_id": row['memory_id'],
+                    "type": row['entity_type'],
+                    "value": row['entity_value'],
+                    "confidence": row['confidence'],
+                    "memory_preview": row['memory_preview'][:100] + "..." if row['memory_preview'] and len(row['memory_preview']) > 100 else row['memory_preview'],
+                    "tenant": row['tenant_name'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                })
+            
+            return {
+                "data": entities,
+                "meta": {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/entities/stats")
+def admin_entity_stats(tenant: dict = Depends(get_tenant)):
+    """Get entity statistics."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Total
+            cur.execute("SELECT COUNT(*) as count FROM entities")
+            total = cur.fetchone()['count']
+            
+            # By type
+            cur.execute("""
+                SELECT entity_type, COUNT(*) as count
+                FROM entities
+                GROUP BY entity_type
+                ORDER BY count DESC
+            """)
+            by_type = {row['entity_type']: row['count'] for row in cur.fetchall()}
+            
+            # Memories with entities
+            cur.execute("""
+                SELECT COUNT(DISTINCT memory_id) as count
+                FROM entities
+            """)
+            memories_enriched = cur.fetchone()['count']
+            
+            # Top entities
+            cur.execute("""
+                SELECT entity_value, entity_type, COUNT(*) as mentions
+                FROM entities
+                GROUP BY entity_value, entity_type
+                ORDER BY mentions DESC
+                LIMIT 10
+            """)
+            top_entities = [
+                {"value": row['entity_value'], "type": row['entity_type'], "mentions": row['mentions']}
+                for row in cur.fetchall()
+            ]
+            
+            return {
+                "total": total,
+                "by_type": by_type,
+                "memories_enriched": memories_enriched,
+                "top_entities": top_entities
             }
         finally:
             cur.close()
@@ -2243,12 +2435,166 @@ def process_reindex_job(job: dict, conn) -> dict:
         cur.close()
 
 
+# Entity types (v1)
+ENTITY_TYPES = ["project", "person", "service", "component", "tool", "concept"]
+
+ENTITY_EXTRACTION_PROMPT = """Extract entities from the following memory content. Return a JSON array of entities.
+
+Each entity should have:
+- type: one of [project, person, service, component, tool, concept]
+- value: the entity name/value
+- confidence: 0.0-1.0 confidence score
+- excerpt: the relevant text span where this entity appears
+
+Only extract entities that are clearly present. Be conservative.
+
+Content:
+{content}
+
+Return ONLY valid JSON array, no other text:
+[{{"type": "project", "value": "GAM", "confidence": 0.9, "excerpt": "GAM Platform"}}]
+"""
+
+
+def extract_entities_llm(content: str, correlation_id: str) -> List[dict]:
+    """Extract entities using LLM."""
+    client = get_openai_client()
+    
+    # Truncate content for extraction
+    content = content[:4000]
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an entity extraction system. Extract named entities from text and return JSON."},
+                {"role": "user", "content": ENTITY_EXTRACTION_PROMPT.format(content=content)}
+            ],
+            temperature=0,
+            max_tokens=1000
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        
+        # Parse JSON (handle potential markdown wrapping)
+        if result_text.startswith("```"):
+            result_text = result_text.split("```")[1]
+            if result_text.startswith("json"):
+                result_text = result_text[4:]
+        
+        entities = json.loads(result_text)
+        
+        # Validate and normalize
+        valid_entities = []
+        for e in entities:
+            if isinstance(e, dict) and 'type' in e and 'value' in e:
+                entity_type = e.get('type', 'concept').lower()
+                if entity_type not in ENTITY_TYPES:
+                    entity_type = 'concept'
+                
+                valid_entities.append({
+                    'type': entity_type,
+                    'value': str(e.get('value', ''))[:500],
+                    'confidence': min(1.0, max(0.0, float(e.get('confidence', 0.8)))),
+                    'excerpt': str(e.get('excerpt', ''))[:200]
+                })
+        
+        return valid_entities
+        
+    except Exception as e:
+        log.error("entity.extraction.llm_error",
+                  correlation_id=correlation_id,
+                  error=str(e))
+        raise
+
+
+def process_entity_extract_job(job: dict, conn) -> dict:
+    """Process an entity extraction job."""
+    correlation_id = generate_correlation_id()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Get memory content
+        cur.execute("""
+            SELECT id, content, tenant_id 
+            FROM memory_entries 
+            WHERE id = %s
+        """, (job['memory_id'],))
+        
+        row = cur.fetchone()
+        if not row:
+            return {"error": "Memory not found"}
+        
+        memory_id = row['id']
+        tenant_id = row['tenant_id']
+        content = row['content']
+        
+        # Skip if too short
+        if len(content) < 20:
+            return {"status": "skipped", "reason": "content_too_short", "entities_count": 0}
+        
+        # Extract entities via LLM
+        start_time = time.time()
+        entities = extract_entities_llm(content, correlation_id)
+        extraction_ms = int((time.time() - start_time) * 1000)
+        
+        log.info("entity.extraction.completed",
+                 correlation_id=correlation_id,
+                 memory_id=memory_id,
+                 entities_count=len(entities),
+                 extraction_ms=extraction_ms)
+        
+        # Idempotent upsert: delete existing entities for this memory first
+        cur.execute("DELETE FROM entities WHERE memory_id = %s", (memory_id,))
+        
+        # Insert new entities
+        inserted = 0
+        for entity in entities:
+            cur.execute("""
+                INSERT INTO entities (tenant_id, memory_id, entity_type, entity_value, confidence, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                tenant_id,
+                memory_id,
+                entity['type'],
+                entity['value'],
+                entity['confidence'],
+                json.dumps({'excerpt': entity.get('excerpt', '')})
+            ))
+            inserted += 1
+        
+        conn.commit()
+        
+        metrics.inc("gam_entities_extracted_total", {"count": str(inserted)})
+        metrics.observe("gam_entity_extraction_ms", extraction_ms)
+        
+        return {
+            "status": "extracted",
+            "memory_id": memory_id,
+            "entities_count": inserted,
+            "extraction_ms": extraction_ms,
+            "entities": entities
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        log.error("entity.extraction.failed",
+                  correlation_id=correlation_id,
+                  memory_id=job['memory_id'],
+                  error=str(e))
+        raise
+    finally:
+        cur.close()
+
+
 def process_job(job: dict) -> dict:
     """Process a single enrichment job."""
     with get_db() as conn:
         if job['job_type'] == 'reindex':
             return process_reindex_job(job, conn)
-        # Other job types will be implemented in D.2, D.3, D.4
+        elif job['job_type'] == 'entity_extract':
+            return process_entity_extract_job(job, conn)
+        # Other job types will be implemented in D.3, D.4
         else:
             return {"status": "not_implemented", "job_type": job['job_type']}
 
