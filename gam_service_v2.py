@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.4.0"
+SERVICE_VERSION = "2.5.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
@@ -920,9 +920,42 @@ def batch_ingest(request: BatchIngestRequest):
         finally:
             cur.close()
 
+# ============================================================
+# Typed Retrieval (Milestone D.3)
+# ============================================================
+
+# Query type detection patterns
+QUERY_TYPE_PATTERNS = {
+    "decision": ["decision", "decided", "chose", "choice", "concluded", "conclusion", "agreed"],
+    "milestone": ["milestone", "achieved", "completed", "shipped", "launched", "released", "finished"],
+    "task": ["task", "todo", "do next", "need to", "action item", "pending", "assigned"],
+    "insight": ["insight", "learned", "realized", "understood", "discovery", "finding", "lesson"],
+    "fact": ["fact", "data", "information", "reference", "definition", "what is", "how does"],
+    "issue": ["issue", "problem", "bug", "error", "concern", "broken", "failed", "failing"]
+}
+
+# Typed hint boost factor (how much to boost matching hints)
+TYPED_HINT_BOOST = 0.15
+
+
+def detect_query_type(query: str) -> Optional[str]:
+    """Detect what type of memory the query is looking for."""
+    query_lower = query.lower()
+    
+    scores = {}
+    for hint_type, patterns in QUERY_TYPE_PATTERNS.items():
+        score = sum(1 for p in patterns if p in query_lower)
+        if score > 0:
+            scores[hint_type] = score
+    
+    if scores:
+        return max(scores, key=scores.get)
+    return None
+
+
 @app.post("/search", response_model=List[SearchResult])
 def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
-    """Hybrid search with attention ranking."""
+    """Hybrid search with attention ranking and typed retrieval."""
     correlation_id = generate_correlation_id()
     start_time = time.time()
     
@@ -939,13 +972,19 @@ def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
             else:
                 raise HTTPException(status_code=400, detail="agent_id or API key required")
             
+            # Detect query type for typed retrieval boost
+            detected_type = detect_query_type(request.query)
+            
             log.info("search.started",
                      correlation_id=correlation_id,
                      tenant_id=str(tenant_id),
                      query_length=len(request.query),
+                     detected_type=detected_type,
                      limit=request.limit)
             
             metrics.inc("gam_search_total", {"tenant": request.agent_id or "api"})
+            if detected_type:
+                metrics.inc("gam_typed_search_total", {"type": detected_type})
             
             query_embedding = generate_embedding(request.query, correlation_id)
             attention_weight = request.attention_weight or ATTENTION_WEIGHT
@@ -953,7 +992,7 @@ def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
             cur.execute("""
                 SELECT 
                     id, content, file_path, committed_at,
-                    source_channel, memory_kind,
+                    source_channel, memory_kind, metadata,
                     COALESCE(salience_score, 0.5) as salience_score,
                     1 - (embedding <=> %s::vector) as similarity
                 FROM memory_entries
@@ -973,7 +1012,18 @@ def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
             for row in rows:
                 similarity = row['similarity']
                 salience = row['salience_score']
-                final_score = similarity * (1 - attention_weight) + salience * attention_weight
+                metadata = row['metadata'] or {}
+                typed_hint = metadata.get('typed_hint')
+                
+                # Base score: similarity + salience
+                base_score = similarity * (1 - attention_weight) + salience * attention_weight
+                
+                # Typed hint boost: if query type matches memory's typed hint
+                typed_boost = 0.0
+                if detected_type and typed_hint == detected_type:
+                    typed_boost = TYPED_HINT_BOOST
+                
+                final_score = min(1.0, base_score + typed_boost)
                 
                 results.append(SearchResult(
                     id=row['id'],
@@ -999,11 +1049,159 @@ def search_memory(request: SearchRequest, tenant: dict = Depends(get_tenant)):
                      correlation_id=correlation_id,
                      tenant_id=str(tenant_id),
                      result_count=len(results),
+                     detected_type=detected_type,
                      duration_ms=duration_ms)
             
             metrics.observe("gam_search_duration_ms", duration_ms, {"tenant": request.agent_id or "api"})
             
             return results
+            
+        finally:
+            cur.close()
+
+
+class TypedSearchRequest(BaseModel):
+    """Typed search request with explicit type filter."""
+    query: str
+    typed_hint: Optional[str] = None  # Explicit type filter
+    agent_id: Optional[str] = None
+    limit: int = Field(default=10, le=50)
+    min_similarity: float = Field(default=0.3, ge=0.0, le=1.0)
+    show_scoring: bool = False  # Show scoring breakdown
+
+
+@app.post("/v3/typed-search")
+def typed_search(request: TypedSearchRequest, tenant: dict = Depends(get_tenant)):
+    """Search with explicit typed hint filter and scoring breakdown."""
+    correlation_id = generate_correlation_id()
+    start_time = time.time()
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            if tenant:
+                tenant_id = tenant['id']
+            elif request.agent_id:
+                cur.execute("SELECT id FROM tenants WHERE name = %s", (request.agent_id,))
+                t = cur.fetchone()
+                tenant_id = t['id'] if t else '00000000-0000-0000-0000-000000000001'
+            else:
+                raise HTTPException(status_code=400, detail="agent_id or API key required")
+            
+            # Use explicit type or detect from query
+            target_type = request.typed_hint or detect_query_type(request.query)
+            
+            log.info("typed_search.started",
+                     correlation_id=correlation_id,
+                     tenant_id=str(tenant_id),
+                     query_length=len(request.query),
+                     target_type=target_type,
+                     limit=request.limit)
+            
+            metrics.inc("gam_typed_search_total", {"type": target_type or "none"})
+            
+            query_embedding = generate_embedding(request.query, correlation_id)
+            
+            # Build query with optional typed hint filter
+            if target_type:
+                # Typed search: get type-matching first, then others
+                cur.execute("""
+                    SELECT 
+                        id, content, file_path, committed_at,
+                        source_channel, memory_kind, metadata,
+                        COALESCE(salience_score, 0.5) as salience_score,
+                        1 - (embedding <=> %s::vector) as similarity
+                    FROM memory_entries
+                    WHERE tenant_id = %s
+                      AND embedding IS NOT NULL
+                      AND 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY 
+                        CASE WHEN metadata->>'typed_hint' = %s THEN 0 ELSE 1 END,
+                        embedding <=> %s::vector
+                    LIMIT %s
+                """, (
+                    query_embedding, tenant_id, query_embedding,
+                    request.min_similarity, target_type, query_embedding, request.limit * 2
+                ))
+            else:
+                cur.execute("""
+                    SELECT 
+                        id, content, file_path, committed_at,
+                        source_channel, memory_kind, metadata,
+                        COALESCE(salience_score, 0.5) as salience_score,
+                        1 - (embedding <=> %s::vector) as similarity
+                    FROM memory_entries
+                    WHERE tenant_id = %s
+                      AND embedding IS NOT NULL
+                      AND 1 - (embedding <=> %s::vector) >= %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (
+                    query_embedding, tenant_id, query_embedding,
+                    request.min_similarity, query_embedding, request.limit * 2
+                ))
+            
+            rows = cur.fetchall()
+            
+            results = []
+            for row in rows:
+                similarity = row['similarity']
+                salience = row['salience_score']
+                metadata = row['metadata'] or {}
+                typed_hint = metadata.get('typed_hint')
+                
+                # Calculate scores
+                semantic_score = similarity
+                salience_weight = 0.3
+                base_score = semantic_score * 0.7 + salience * salience_weight
+                
+                # Typed boost
+                typed_boost = TYPED_HINT_BOOST if (target_type and typed_hint == target_type) else 0.0
+                final_score = min(1.0, base_score + typed_boost)
+                
+                result = {
+                    "id": row['id'],
+                    "content": row['content'][:500] + "..." if len(row['content']) > 500 else row['content'],
+                    "memory_kind": row['memory_kind'] or 'note',
+                    "typed_hint": typed_hint,
+                    "final_score": round(final_score, 4)
+                }
+                
+                if request.show_scoring:
+                    result["scoring"] = {
+                        "semantic_similarity": round(semantic_score, 4),
+                        "salience": round(salience, 4),
+                        "base_score": round(base_score, 4),
+                        "typed_boost": round(typed_boost, 4),
+                        "target_type": target_type,
+                        "memory_hint": typed_hint,
+                        "boost_applied": typed_boost > 0,
+                        "formula": "final = (similarity * 0.7 + salience * 0.3) + typed_boost"
+                    }
+                
+                results.append(result)
+            
+            results.sort(key=lambda x: x['final_score'], reverse=True)
+            results = results[:request.limit]
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            log.info("typed_search.completed",
+                     correlation_id=correlation_id,
+                     result_count=len(results),
+                     target_type=target_type,
+                     duration_ms=duration_ms)
+            
+            metrics.observe("gam_typed_search_duration_ms", duration_ms)
+            
+            return {
+                "query": request.query,
+                "target_type": target_type,
+                "results": results,
+                "total": len(results),
+                "duration_ms": duration_ms
+            }
             
         finally:
             cur.close()
@@ -1618,7 +1816,11 @@ def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
                     "suppressed_at": metadata.get('suppressed_at'),
                     "suppressed_reason": metadata.get('suppressed_reason')
                 },
-                "entities": get_memory_entities_internal(cur, memory_id, row['tenant_id'])
+                "enrichment": {
+                    "typed_hint": metadata.get('typed_hint'),
+                    "typed_hint_at": metadata.get('typed_hint_at'),
+                    "entities": get_memory_entities_internal(cur, memory_id, row['tenant_id'])
+                }
             }
         finally:
             cur.close()
@@ -2056,6 +2258,62 @@ def admin_list_entities(
             }
         finally:
             cur.close()
+
+
+@app.get("/admin/typed-hints/stats")
+def admin_typed_hint_stats(tenant: dict = Depends(get_tenant)):
+    """Get typed hint statistics."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Total with hints
+            cur.execute("""
+                SELECT COUNT(*) as count
+                FROM memory_entries
+                WHERE metadata->>'typed_hint' IS NOT NULL
+            """)
+            total_hinted = cur.fetchone()['count']
+            
+            # By type
+            cur.execute("""
+                SELECT metadata->>'typed_hint' as hint_type, COUNT(*) as count
+                FROM memory_entries
+                WHERE metadata->>'typed_hint' IS NOT NULL
+                GROUP BY metadata->>'typed_hint'
+                ORDER BY count DESC
+            """)
+            by_type = {row['hint_type']: row['count'] for row in cur.fetchall()}
+            
+            # Total memories
+            cur.execute("SELECT COUNT(*) as count FROM memory_entries")
+            total_memories = cur.fetchone()['count']
+            
+            # Coverage
+            coverage = round(total_hinted / total_memories * 100, 2) if total_memories > 0 else 0
+            
+            return {
+                "total_hinted": total_hinted,
+                "total_memories": total_memories,
+                "coverage_percent": coverage,
+                "by_type": by_type,
+                "available_types": TYPED_HINT_CATEGORIES
+            }
+        finally:
+            cur.close()
+
+
+@app.post("/jobs/typed-hint/{memory_id}")
+def enqueue_typed_hint(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Enqueue a typed hint job (convenience endpoint)."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    request = EnqueueJobRequest(job_type="typed_hint", memory_id=memory_id, priority=1)
+    return enqueue_job(request, tenant)
 
 
 @app.get("/admin/entities/stats")
@@ -2587,6 +2845,139 @@ def process_entity_extract_job(job: dict, conn) -> dict:
         cur.close()
 
 
+TYPED_HINT_PROMPT = """Classify this memory content into exactly ONE category. Return ONLY the category name, nothing else.
+
+Categories:
+- decision: A choice or conclusion that was made
+- milestone: An achievement or significant event completed
+- task: Something that needs to be done or was done
+- insight: A realization, learning, or understanding
+- fact: A piece of information or reference data
+- issue: A problem, bug, or concern
+
+Content:
+{content}
+
+Category:"""
+
+
+def classify_typed_hint(content: str, correlation_id: str) -> Optional[str]:
+    """Classify memory content into a typed hint category."""
+    client = get_openai_client()
+    
+    # Truncate content
+    content = content[:2000]
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a classification system. Return only the category name."},
+                {"role": "user", "content": TYPED_HINT_PROMPT.format(content=content)}
+            ],
+            temperature=0,
+            max_tokens=20
+        )
+        
+        result = response.choices[0].message.content.strip().lower()
+        
+        # Normalize and validate
+        if result in TYPED_HINT_CATEGORIES:
+            return result
+        
+        # Try to extract category from response
+        for cat in TYPED_HINT_CATEGORIES:
+            if cat in result:
+                return cat
+        
+        log.warning("typed_hint.classification.unknown",
+                    correlation_id=correlation_id,
+                    result=result)
+        return None
+        
+    except Exception as e:
+        log.error("typed_hint.classification.error",
+                  correlation_id=correlation_id,
+                  error=str(e))
+        raise
+
+
+def process_typed_hint_job(job: dict, conn) -> dict:
+    """Process a typed hint classification job."""
+    correlation_id = generate_correlation_id()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Get memory content
+        cur.execute("""
+            SELECT id, content, tenant_id, metadata
+            FROM memory_entries 
+            WHERE id = %s
+        """, (job['memory_id'],))
+        
+        row = cur.fetchone()
+        if not row:
+            return {"error": "Memory not found"}
+        
+        memory_id = row['id']
+        content = row['content']
+        metadata = row['metadata'] or {}
+        
+        # Skip if too short
+        if len(content) < 10:
+            return {"status": "skipped", "reason": "content_too_short"}
+        
+        # Classify via LLM
+        start_time = time.time()
+        hint_type = classify_typed_hint(content, correlation_id)
+        classification_ms = int((time.time() - start_time) * 1000)
+        
+        if hint_type:
+            # Store hint in metadata
+            metadata['typed_hint'] = hint_type
+            metadata['typed_hint_at'] = datetime.now(timezone.utc).isoformat()
+            
+            cur.execute("""
+                UPDATE memory_entries
+                SET metadata = %s
+                WHERE id = %s
+            """, (json.dumps(metadata), memory_id))
+            
+            conn.commit()
+            
+            log.info("typed_hint.completed",
+                     correlation_id=correlation_id,
+                     memory_id=memory_id,
+                     hint_type=hint_type,
+                     classification_ms=classification_ms)
+            
+            metrics.inc("gam_typed_hints_total", {"type": hint_type})
+            metrics.observe("gam_typed_hint_ms", classification_ms)
+            
+            return {
+                "status": "classified",
+                "memory_id": memory_id,
+                "typed_hint": hint_type,
+                "classification_ms": classification_ms
+            }
+        else:
+            return {
+                "status": "unclassified",
+                "memory_id": memory_id,
+                "reason": "no_matching_category"
+            }
+        
+    except Exception as e:
+        conn.rollback()
+        log.error("typed_hint.failed",
+                  correlation_id=correlation_id,
+                  memory_id=job['memory_id'],
+                  error=str(e))
+        raise
+    finally:
+        cur.close()
+
+
 def process_job(job: dict) -> dict:
     """Process a single enrichment job."""
     with get_db() as conn:
@@ -2594,7 +2985,9 @@ def process_job(job: dict) -> dict:
             return process_reindex_job(job, conn)
         elif job['job_type'] == 'entity_extract':
             return process_entity_extract_job(job, conn)
-        # Other job types will be implemented in D.3, D.4
+        elif job['job_type'] == 'typed_hint':
+            return process_typed_hint_job(job, conn)
+        # Relation linking will be implemented in D.4
         else:
             return {"status": "not_implemented", "job_type": job['job_type']}
 
