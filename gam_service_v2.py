@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.2.0"
+SERVICE_VERSION = "2.3.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
@@ -361,6 +361,93 @@ def run_migrations(conn):
             
             conn.commit()
             log.info("db.migrations.complete")
+        
+        # V2.3 Enrichment migrations
+        run_enrichment_migrations(conn)
+    finally:
+        cur.close()
+
+
+def run_enrichment_migrations(conn):
+    """Run v2.3 enrichment schema migrations."""
+    cur = conn.cursor()
+    try:
+        # Check if enrichment_jobs exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'enrichment_jobs'
+            )
+        """)
+        if not cur.fetchone()[0]:
+            log.info("db.migrations.enrichment.running")
+            
+            # Enrichment Jobs table
+            cur.execute("""
+                CREATE TABLE enrichment_jobs (
+                    id SERIAL PRIMARY KEY,
+                    job_id VARCHAR(50) UNIQUE NOT NULL,
+                    job_type VARCHAR(50) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    memory_id INTEGER REFERENCES memory_entries(id),
+                    tenant_id UUID NOT NULL,
+                    priority INTEGER DEFAULT 1,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    started_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    result JSONB,
+                    error TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 3
+                )
+            """)
+            cur.execute("CREATE INDEX idx_jobs_status ON enrichment_jobs(status)")
+            cur.execute("CREATE INDEX idx_jobs_tenant ON enrichment_jobs(tenant_id)")
+            cur.execute("CREATE INDEX idx_jobs_memory ON enrichment_jobs(memory_id)")
+            cur.execute("CREATE INDEX idx_jobs_type_status ON enrichment_jobs(job_type, status)")
+            
+            # Entities table
+            cur.execute("""
+                CREATE TABLE entities (
+                    id SERIAL PRIMARY KEY,
+                    tenant_id UUID NOT NULL,
+                    memory_id INTEGER NOT NULL REFERENCES memory_entries(id),
+                    entity_type VARCHAR(50) NOT NULL,
+                    entity_value TEXT NOT NULL,
+                    confidence FLOAT DEFAULT 1.0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    metadata JSONB DEFAULT '{}'
+                )
+            """)
+            cur.execute("CREATE INDEX idx_entities_tenant ON entities(tenant_id)")
+            cur.execute("CREATE INDEX idx_entities_memory ON entities(memory_id)")
+            cur.execute("CREATE INDEX idx_entities_type_value ON entities(entity_type, entity_value)")
+            
+            # Relations table
+            cur.execute("""
+                CREATE TABLE relations (
+                    id SERIAL PRIMARY KEY,
+                    tenant_id UUID NOT NULL,
+                    source_memory_id INTEGER NOT NULL REFERENCES memory_entries(id),
+                    subject_entity_id INTEGER REFERENCES entities(id),
+                    predicate VARCHAR(50) NOT NULL,
+                    object_entity_id INTEGER REFERENCES entities(id),
+                    object_memory_id INTEGER REFERENCES memory_entries(id),
+                    confidence FLOAT DEFAULT 1.0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    metadata JSONB DEFAULT '{}'
+                )
+            """)
+            cur.execute("CREATE INDEX idx_relations_tenant ON relations(tenant_id)")
+            cur.execute("CREATE INDEX idx_relations_subject ON relations(subject_entity_id)")
+            cur.execute("CREATE INDEX idx_relations_object ON relations(object_entity_id)")
+            cur.execute("CREATE INDEX idx_relations_predicate ON relations(predicate)")
+            
+            conn.commit()
+            log.info("db.migrations.enrichment.complete")
+    except Exception as e:
+        log.error("db.migrations.enrichment.error", error=str(e))
+        conn.rollback()
     finally:
         cur.close()
 
@@ -1830,6 +1917,470 @@ def admin_search(request: AdminSearchRequest, tenant: dict = Depends(get_tenant)
             }
         finally:
             cur.close()
+
+
+# ============================================================
+# Enrichment Job Infrastructure (Milestone D)
+# ============================================================
+
+# Job types
+JOB_TYPES = ["entity_extract", "relation_link", "typed_hint", "summary_generate", "reindex"]
+JOB_STATUSES = ["pending", "running", "completed", "failed"]
+
+# Typed hint categories (locked)
+TYPED_HINT_CATEGORIES = ["decision", "milestone", "task", "insight", "fact", "issue"]
+
+# Relation types (v1)
+RELATION_TYPES = ["related_to", "supports", "follows", "references"]
+
+
+def generate_job_id() -> str:
+    """Generate unique job ID."""
+    return f"job-{uuid.uuid4().hex[:12]}"
+
+
+class EnqueueJobRequest(BaseModel):
+    job_type: str
+    memory_id: int
+    priority: int = 1
+
+
+@app.post("/jobs/enqueue")
+def enqueue_job(request: EnqueueJobRequest, tenant: dict = Depends(get_tenant)):
+    """Enqueue an enrichment job."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    if request.job_type not in JOB_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid job_type. Must be one of: {JOB_TYPES}")
+    
+    log.info("job.enqueue.started",
+             correlation_id=correlation_id,
+             job_type=request.job_type,
+             memory_id=request.memory_id)
+    
+    job_id = generate_job_id()
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Verify memory exists and belongs to tenant
+            cur.execute("""
+                SELECT id FROM memory_entries 
+                WHERE id = %s AND tenant_id = %s
+            """, (request.memory_id, tenant['id']))
+            
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            cur.execute("""
+                INSERT INTO enrichment_jobs 
+                (job_id, job_type, memory_id, tenant_id, priority, status)
+                VALUES (%s, %s, %s, %s, %s, 'pending')
+                RETURNING id, job_id, created_at
+            """, (job_id, request.job_type, request.memory_id, tenant['id'], request.priority))
+            
+            row = cur.fetchone()
+            conn.commit()
+            
+            log.info("job.enqueue.completed",
+                     correlation_id=correlation_id,
+                     job_id=job_id,
+                     job_type=request.job_type)
+            
+            metrics.inc("gam_jobs_enqueued_total", {"job_type": request.job_type})
+            
+            return {
+                "job_id": row['job_id'],
+                "status": "pending",
+                "created_at": row['created_at'].isoformat()
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str, tenant: dict = Depends(get_tenant)):
+    """Get job status."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("""
+                SELECT * FROM enrichment_jobs 
+                WHERE job_id = %s AND tenant_id = %s
+            """, (job_id, tenant['id']))
+            
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job not found")
+            
+            return {
+                "job_id": row['job_id'],
+                "job_type": row['job_type'],
+                "status": row['status'],
+                "memory_id": row['memory_id'],
+                "priority": row['priority'],
+                "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                "started_at": row['started_at'].isoformat() if row['started_at'] else None,
+                "completed_at": row['completed_at'].isoformat() if row['completed_at'] else None,
+                "result": row['result'],
+                "error": row['error'],
+                "retry_count": row['retry_count']
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/jobs")
+def admin_list_jobs(
+    status: Optional[str] = None,
+    job_type: Optional[str] = None,
+    memory_id: Optional[int] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = 0,
+    tenant: dict = Depends(get_tenant)
+):
+    """List enrichment jobs (admin)."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            where_clauses = []
+            params = []
+            
+            if status:
+                where_clauses.append("status = %s")
+                params.append(status)
+            
+            if job_type:
+                where_clauses.append("job_type = %s")
+                params.append(job_type)
+            
+            if memory_id:
+                where_clauses.append("memory_id = %s")
+                params.append(memory_id)
+            
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+            
+            cur.execute(f"SELECT COUNT(*) FROM enrichment_jobs WHERE {where_sql}", params)
+            total = cur.fetchone()['count']
+            
+            cur.execute(f"""
+                SELECT * FROM enrichment_jobs
+                WHERE {where_sql}
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, params + [limit, offset])
+            
+            jobs = []
+            for row in cur.fetchall():
+                jobs.append({
+                    "job_id": row['job_id'],
+                    "job_type": row['job_type'],
+                    "status": row['status'],
+                    "memory_id": row['memory_id'],
+                    "priority": row['priority'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
+                    "started_at": row['started_at'].isoformat() if row['started_at'] else None,
+                    "completed_at": row['completed_at'].isoformat() if row['completed_at'] else None,
+                    "error": row['error'],
+                    "retry_count": row['retry_count']
+                })
+            
+            return {
+                "data": jobs,
+                "meta": {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/jobs/stats")
+def admin_job_stats(tenant: dict = Depends(get_tenant)):
+    """Get job queue statistics."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # By status
+            cur.execute("""
+                SELECT status, COUNT(*) as count
+                FROM enrichment_jobs
+                GROUP BY status
+            """)
+            by_status = {row['status']: row['count'] for row in cur.fetchall()}
+            
+            # By type
+            cur.execute("""
+                SELECT job_type, COUNT(*) as count
+                FROM enrichment_jobs
+                GROUP BY job_type
+            """)
+            by_type = {row['job_type']: row['count'] for row in cur.fetchall()}
+            
+            # Recent activity
+            cur.execute("""
+                SELECT COUNT(*) as count
+                FROM enrichment_jobs
+                WHERE created_at > NOW() - INTERVAL '1 hour'
+            """)
+            last_hour = cur.fetchone()['count']
+            
+            # Failed jobs
+            cur.execute("""
+                SELECT COUNT(*) as count
+                FROM enrichment_jobs
+                WHERE status = 'failed' AND retry_count >= max_retries
+            """)
+            exhausted = cur.fetchone()['count']
+            
+            return {
+                "by_status": by_status,
+                "by_type": by_type,
+                "last_hour": last_hour,
+                "exhausted_retries": exhausted
+            }
+        finally:
+            cur.close()
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, tenant: dict = Depends(get_tenant)):
+    """Retry a failed job."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("""
+                UPDATE enrichment_jobs
+                SET status = 'pending', 
+                    error = NULL,
+                    started_at = NULL,
+                    completed_at = NULL
+                WHERE job_id = %s AND tenant_id = %s AND status = 'failed'
+                RETURNING job_id
+            """, (job_id, tenant['id']))
+            
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job not found or not in failed state")
+            
+            conn.commit()
+            
+            log.info("job.retry.queued", job_id=job_id)
+            metrics.inc("gam_jobs_retried_total")
+            
+            return {"job_id": job_id, "status": "pending"}
+        finally:
+            cur.close()
+
+
+# Wire reindex action to job queue
+@app.post("/jobs/reindex/{memory_id}")
+def enqueue_reindex(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Enqueue a reindex job (convenience endpoint)."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    # Use the standard enqueue path
+    request = EnqueueJobRequest(job_type="reindex", memory_id=memory_id, priority=2)
+    return enqueue_job(request, tenant)
+
+
+# ============================================================
+# Worker Loop (Background Processing)
+# ============================================================
+
+import threading
+import traceback
+
+_worker_running = False
+_worker_thread = None
+
+def process_reindex_job(job: dict, conn) -> dict:
+    """Process a reindex job."""
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT content FROM memory_entries WHERE id = %s", (job['memory_id'],))
+        row = cur.fetchone()
+        if not row:
+            return {"error": "Memory not found"}
+        
+        # Generate new embedding
+        correlation_id = generate_correlation_id()
+        embedding = generate_embedding(row['content'], correlation_id)
+        
+        # Update embedding
+        cur.execute("""
+            UPDATE memory_entries 
+            SET embedding = %s::vector
+            WHERE id = %s
+        """, (embedding, job['memory_id']))
+        
+        conn.commit()
+        return {"status": "reindexed", "memory_id": job['memory_id']}
+    finally:
+        cur.close()
+
+
+def process_job(job: dict) -> dict:
+    """Process a single enrichment job."""
+    with get_db() as conn:
+        if job['job_type'] == 'reindex':
+            return process_reindex_job(job, conn)
+        # Other job types will be implemented in D.2, D.3, D.4
+        else:
+            return {"status": "not_implemented", "job_type": job['job_type']}
+
+
+def worker_loop():
+    """Background worker loop for processing jobs."""
+    global _worker_running
+    
+    log.info("worker.started")
+    
+    while _worker_running:
+        try:
+            with get_db() as conn:
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                
+                # Claim a pending job
+                cur.execute("""
+                    UPDATE enrichment_jobs
+                    SET status = 'running', started_at = NOW()
+                    WHERE id = (
+                        SELECT id FROM enrichment_jobs
+                        WHERE status = 'pending'
+                        ORDER BY priority DESC, created_at ASC
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING *
+                """)
+                
+                job = cur.fetchone()
+                conn.commit()
+                cur.close()
+                
+                if job:
+                    log.info("worker.job.started", 
+                             job_id=job['job_id'], 
+                             job_type=job['job_type'])
+                    
+                    start_time = time.time()
+                    
+                    try:
+                        result = process_job(dict(job))
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        
+                        # Mark completed
+                        cur2 = conn.cursor()
+                        cur2.execute("""
+                            UPDATE enrichment_jobs
+                            SET status = 'completed', 
+                                completed_at = NOW(),
+                                result = %s
+                            WHERE job_id = %s
+                        """, (json.dumps(result), job['job_id']))
+                        conn.commit()
+                        cur2.close()
+                        
+                        log.info("worker.job.completed",
+                                 job_id=job['job_id'],
+                                 job_type=job['job_type'],
+                                 duration_ms=duration_ms)
+                        
+                        metrics.inc("gam_jobs_completed_total", {"job_type": job['job_type']})
+                        metrics.observe("gam_job_duration_ms", duration_ms, {"job_type": job['job_type']})
+                        
+                    except Exception as e:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        error_msg = str(e)
+                        
+                        # Check retries
+                        retry_count = job['retry_count'] + 1
+                        new_status = 'pending' if retry_count < job['max_retries'] else 'failed'
+                        
+                        cur2 = conn.cursor()
+                        cur2.execute("""
+                            UPDATE enrichment_jobs
+                            SET status = %s, 
+                                error = %s,
+                                retry_count = %s,
+                                completed_at = CASE WHEN %s = 'failed' THEN NOW() ELSE NULL END
+                            WHERE job_id = %s
+                        """, (new_status, error_msg, retry_count, new_status, job['job_id']))
+                        conn.commit()
+                        cur2.close()
+                        
+                        log.error("worker.job.failed",
+                                  job_id=job['job_id'],
+                                  job_type=job['job_type'],
+                                  error=error_msg,
+                                  retry_count=retry_count,
+                                  duration_ms=duration_ms)
+                        
+                        metrics.inc("gam_jobs_failed_total", {"job_type": job['job_type']})
+                else:
+                    # No jobs, sleep
+                    time.sleep(1)
+                    
+        except Exception as e:
+            log.error("worker.error", error=str(e), traceback=traceback.format_exc())
+            time.sleep(5)
+    
+    log.info("worker.stopped")
+
+
+def start_worker():
+    """Start background worker thread."""
+    global _worker_running, _worker_thread
+    
+    if _worker_running:
+        return
+    
+    _worker_running = True
+    _worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    _worker_thread.start()
+    log.info("worker.thread.started")
+
+
+def stop_worker():
+    """Stop background worker thread."""
+    global _worker_running
+    _worker_running = False
+    log.info("worker.thread.stopping")
+
+
+# Start worker on app startup
+@app.on_event("startup")
+async def start_enrichment_worker():
+    start_worker()
+
+
+@app.on_event("shutdown")
+async def stop_enrichment_worker():
+    stop_worker()
 
 
 if __name__ == "__main__":
