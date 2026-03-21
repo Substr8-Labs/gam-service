@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.5.0"
+SERVICE_VERSION = "2.6.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
@@ -1755,9 +1755,34 @@ def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
             metadata = row['metadata'] or {}
             content_hash = hashlib.sha256(row['content'].encode()).hexdigest()[:16]
             
-            # Get related memories
+            # Get related memories (explicit relations + semantic fallback)
             related = []
-            if row['has_embedding']:
+            seen_ids = set()
+            
+            # First: explicit relations (highest priority)
+            cur.execute("""
+                SELECT r.object_memory_id as id, r.predicate, r.confidence,
+                       m.content, m.memory_kind
+                FROM relations r
+                JOIN memory_entries m ON r.object_memory_id = m.id
+                WHERE r.source_memory_id = %s AND r.tenant_id = %s
+                ORDER BY r.confidence DESC
+                LIMIT 3
+            """, (memory_id, row['tenant_id']))
+            
+            for rel in cur.fetchall():
+                related.append({
+                    "id": rel['id'],
+                    "score": round(rel['confidence'], 4),
+                    "preview": rel['content'][:100] + "..." if len(rel['content']) > 100 else rel['content'],
+                    "kind": rel['memory_kind'],
+                    "source": "explicit_relation",
+                    "predicate": rel['predicate']
+                })
+                seen_ids.add(rel['id'])
+            
+            # Then: semantic similarity (fill remaining slots)
+            if row['has_embedding'] and len(related) < 5:
                 cur.execute("""
                     WITH source AS (
                         SELECT embedding FROM memory_entries WHERE id = %s
@@ -1771,16 +1796,18 @@ def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
                       AND m.embedding IS NOT NULL
                       AND 1 - (m.embedding <=> source.embedding) >= 0.3
                     ORDER BY m.embedding <=> source.embedding
-                    LIMIT 5
-                """, (memory_id, row['tenant_id'], memory_id))
+                    LIMIT %s
+                """, (memory_id, row['tenant_id'], memory_id, 5 - len(related)))
                 
                 for rel in cur.fetchall():
-                    related.append({
-                        "id": rel['id'],
-                        "score": round(rel['similarity'], 4),
-                        "preview": rel['content'][:100] + "..." if len(rel['content']) > 100 else rel['content'],
-                        "kind": rel['memory_kind']
-                    })
+                    if rel['id'] not in seen_ids:
+                        related.append({
+                            "id": rel['id'],
+                            "score": round(rel['similarity'], 4),
+                            "preview": rel['content'][:100] + "..." if len(rel['content']) > 100 else rel['content'],
+                            "kind": rel['memory_kind'],
+                            "source": "semantic"
+                        })
             
             return {
                 "id": row['id'],
@@ -1819,7 +1846,8 @@ def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
                 "enrichment": {
                     "typed_hint": metadata.get('typed_hint'),
                     "typed_hint_at": metadata.get('typed_hint_at'),
-                    "entities": get_memory_entities_internal(cur, memory_id, row['tenant_id'])
+                    "entities": get_memory_entities_internal(cur, memory_id, row['tenant_id']),
+                    "relations": get_memory_relations_internal(cur, memory_id, row['tenant_id'])
                 }
             }
         finally:
@@ -1845,6 +1873,55 @@ def get_memory_entities_internal(cur, memory_id: int, tenant_id) -> List[dict]:
             "excerpt": row['metadata'].get('excerpt') if row['metadata'] else None
         })
     return entities
+
+
+def get_memory_relations_internal(cur, memory_id: int, tenant_id) -> dict:
+    """Get relations for a memory (internal helper)."""
+    # Outgoing relations
+    cur.execute("""
+        SELECT r.object_memory_id as target_id, r.predicate, r.confidence,
+               m.content as target_preview, m.memory_kind as target_kind
+        FROM relations r
+        JOIN memory_entries m ON r.object_memory_id = m.id
+        WHERE r.source_memory_id = %s AND r.tenant_id = %s
+        ORDER BY r.confidence DESC
+        LIMIT 5
+    """, (memory_id, tenant_id))
+    
+    outgoing = []
+    for row in cur.fetchall():
+        outgoing.append({
+            "target_id": row['target_id'],
+            "predicate": row['predicate'],
+            "confidence": row['confidence'],
+            "preview": row['target_preview'][:80] + "..." if len(row['target_preview']) > 80 else row['target_preview']
+        })
+    
+    # Incoming relations
+    cur.execute("""
+        SELECT r.source_memory_id as source_id, r.predicate, r.confidence,
+               m.content as source_preview
+        FROM relations r
+        JOIN memory_entries m ON r.source_memory_id = m.id
+        WHERE r.object_memory_id = %s AND r.tenant_id = %s
+        ORDER BY r.confidence DESC
+        LIMIT 5
+    """, (memory_id, tenant_id))
+    
+    incoming = []
+    for row in cur.fetchall():
+        incoming.append({
+            "source_id": row['source_id'],
+            "predicate": row['predicate'],
+            "confidence": row['confidence'],
+            "preview": row['source_preview'][:80] + "..." if len(row['source_preview']) > 80 else row['source_preview']
+        })
+    
+    return {
+        "outgoing": outgoing,
+        "incoming": incoming,
+        "total": len(outgoing) + len(incoming)
+    }
 
 
 @app.post("/admin/memories/{memory_id}/suppress")
@@ -2314,6 +2391,194 @@ def enqueue_typed_hint(memory_id: int, tenant: dict = Depends(get_tenant)):
     
     request = EnqueueJobRequest(job_type="typed_hint", memory_id=memory_id, priority=1)
     return enqueue_job(request, tenant)
+
+
+@app.post("/jobs/relation-link/{memory_id}")
+def enqueue_relation_link(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Enqueue a relation linking job (convenience endpoint)."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    request = EnqueueJobRequest(job_type="relation_link", memory_id=memory_id, priority=1)
+    return enqueue_job(request, tenant)
+
+
+@app.get("/memory/{memory_id}/relations")
+def get_memory_relations(memory_id: int, tenant: dict = Depends(get_tenant)):
+    """Get explicit relations for a memory."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Get outgoing relations
+            cur.execute("""
+                SELECT r.*, m.content as target_content, m.memory_kind as target_kind
+                FROM relations r
+                JOIN memory_entries m ON r.object_memory_id = m.id
+                WHERE r.source_memory_id = %s AND r.tenant_id = %s
+                ORDER BY r.confidence DESC
+            """, (memory_id, tenant['id']))
+            
+            outgoing = []
+            for row in cur.fetchall():
+                outgoing.append({
+                    "id": row['id'],
+                    "target_id": row['object_memory_id'],
+                    "predicate": row['predicate'],
+                    "confidence": row['confidence'],
+                    "target_preview": row['target_content'][:100] + "..." if len(row['target_content']) > 100 else row['target_content'],
+                    "target_kind": row['target_kind'],
+                    "metadata": row['metadata']
+                })
+            
+            # Get incoming relations
+            cur.execute("""
+                SELECT r.*, m.content as source_content, m.memory_kind as source_kind
+                FROM relations r
+                JOIN memory_entries m ON r.source_memory_id = m.id
+                WHERE r.object_memory_id = %s AND r.tenant_id = %s
+                ORDER BY r.confidence DESC
+            """, (memory_id, tenant['id']))
+            
+            incoming = []
+            for row in cur.fetchall():
+                incoming.append({
+                    "id": row['id'],
+                    "source_id": row['source_memory_id'],
+                    "predicate": row['predicate'],
+                    "confidence": row['confidence'],
+                    "source_preview": row['source_content'][:100] + "..." if len(row['source_content']) > 100 else row['source_content'],
+                    "source_kind": row['source_kind']
+                })
+            
+            return {
+                "memory_id": memory_id,
+                "outgoing": outgoing,
+                "incoming": incoming,
+                "total": len(outgoing) + len(incoming)
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/relations")
+def admin_list_relations(
+    predicate: Optional[str] = None,
+    memory_id: Optional[int] = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = 0,
+    tenant: dict = Depends(get_tenant)
+):
+    """List relations with filters (admin)."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            where_clauses = []
+            params = []
+            
+            if predicate:
+                where_clauses.append("r.predicate = %s")
+                params.append(predicate)
+            
+            if memory_id:
+                where_clauses.append("(r.source_memory_id = %s OR r.object_memory_id = %s)")
+                params.extend([memory_id, memory_id])
+            
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+            
+            cur.execute(f"SELECT COUNT(*) FROM relations r WHERE {where_sql}", params)
+            total = cur.fetchone()['count']
+            
+            cur.execute(f"""
+                SELECT r.*, 
+                       s.content as source_preview, s.memory_kind as source_kind,
+                       o.content as object_preview, o.memory_kind as object_kind
+                FROM relations r
+                JOIN memory_entries s ON r.source_memory_id = s.id
+                JOIN memory_entries o ON r.object_memory_id = o.id
+                WHERE {where_sql}
+                ORDER BY r.created_at DESC
+                LIMIT %s OFFSET %s
+            """, params + [limit, offset])
+            
+            relations = []
+            for row in cur.fetchall():
+                relations.append({
+                    "id": row['id'],
+                    "source_id": row['source_memory_id'],
+                    "object_id": row['object_memory_id'],
+                    "predicate": row['predicate'],
+                    "confidence": row['confidence'],
+                    "source_preview": row['source_preview'][:80] + "..." if len(row['source_preview']) > 80 else row['source_preview'],
+                    "object_preview": row['object_preview'][:80] + "..." if len(row['object_preview']) > 80 else row['object_preview'],
+                    "source_kind": row['source_kind'],
+                    "object_kind": row['object_kind'],
+                    "metadata": row['metadata'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                })
+            
+            return {
+                "data": relations,
+                "meta": {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/relations/stats")
+def admin_relation_stats(tenant: dict = Depends(get_tenant)):
+    """Get relation statistics."""
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    with get_db() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Total
+            cur.execute("SELECT COUNT(*) as count FROM relations")
+            total = cur.fetchone()['count']
+            
+            # By predicate
+            cur.execute("""
+                SELECT predicate, COUNT(*) as count
+                FROM relations
+                GROUP BY predicate
+                ORDER BY count DESC
+            """)
+            by_predicate = {row['predicate']: row['count'] for row in cur.fetchall()}
+            
+            # Memories with relations
+            cur.execute("""
+                SELECT COUNT(DISTINCT source_memory_id) as count
+                FROM relations
+            """)
+            memories_linked = cur.fetchone()['count']
+            
+            # Average confidence
+            cur.execute("SELECT AVG(confidence) as avg FROM relations")
+            avg_confidence = round(cur.fetchone()['avg'] or 0, 4)
+            
+            return {
+                "total": total,
+                "by_predicate": by_predicate,
+                "memories_linked": memories_linked,
+                "avg_confidence": avg_confidence,
+                "available_predicates": RELATION_TYPES_V1
+            }
+        finally:
+            cur.close()
 
 
 @app.get("/admin/entities/stats")
@@ -2978,6 +3243,200 @@ def process_typed_hint_job(job: dict, conn) -> dict:
         cur.close()
 
 
+# ============================================================
+# Relation Linking (Milestone D.4)
+# ============================================================
+
+# Relation types (v1 - locked)
+RELATION_TYPES_V1 = ["related_to", "supports", "follows", "references"]
+
+# Minimum similarity for relation creation
+RELATION_MIN_SIMILARITY = 0.5
+RELATION_MIN_ENTITY_OVERLAP = 1
+
+
+def find_relation_candidates(memory_id: int, tenant_id, cur) -> List[dict]:
+    """Find candidate memories to link based on entities and semantic similarity."""
+    candidates = []
+    
+    # Get source memory's entities
+    cur.execute("""
+        SELECT entity_type, entity_value 
+        FROM entities 
+        WHERE memory_id = %s AND tenant_id = %s
+    """, (memory_id, tenant_id))
+    source_entities = {(r['entity_type'], r['entity_value']) for r in cur.fetchall()}
+    
+    # Get source memory's typed hint
+    cur.execute("""
+        SELECT metadata->>'typed_hint' as typed_hint
+        FROM memory_entries
+        WHERE id = %s
+    """, (memory_id,))
+    source_row = cur.fetchone()
+    source_hint = source_row['typed_hint'] if source_row else None
+    
+    if not source_entities and not source_hint:
+        return []
+    
+    # Find memories with overlapping entities
+    if source_entities:
+        entity_values = [v for _, v in source_entities]
+        cur.execute("""
+            SELECT DISTINCT e.memory_id, COUNT(*) as overlap_count
+            FROM entities e
+            WHERE e.tenant_id = %s
+              AND e.memory_id != %s
+              AND e.entity_value = ANY(%s)
+            GROUP BY e.memory_id
+            HAVING COUNT(*) >= %s
+            ORDER BY overlap_count DESC
+            LIMIT 10
+        """, (tenant_id, memory_id, entity_values, RELATION_MIN_ENTITY_OVERLAP))
+        
+        for row in cur.fetchall():
+            candidates.append({
+                'memory_id': row['memory_id'],
+                'entity_overlap': row['overlap_count'],
+                'relation_type': 'related_to',
+                'confidence': min(1.0, 0.5 + row['overlap_count'] * 0.1)
+            })
+    
+    # Find semantically similar memories with same typed hint
+    if source_hint:
+        cur.execute("""
+            WITH source AS (
+                SELECT embedding FROM memory_entries WHERE id = %s
+            )
+            SELECT 
+                m.id as memory_id,
+                1 - (m.embedding <=> source.embedding) as similarity,
+                m.metadata->>'typed_hint' as hint
+            FROM memory_entries m, source
+            WHERE m.tenant_id = %s
+              AND m.id != %s
+              AND m.embedding IS NOT NULL
+              AND m.metadata->>'typed_hint' = %s
+              AND 1 - (m.embedding <=> source.embedding) >= %s
+            ORDER BY m.embedding <=> source.embedding
+            LIMIT 5
+        """, (memory_id, tenant_id, memory_id, source_hint, RELATION_MIN_SIMILARITY))
+        
+        for row in cur.fetchall():
+            # Check if already in candidates
+            existing = next((c for c in candidates if c['memory_id'] == row['memory_id']), None)
+            if existing:
+                existing['confidence'] = min(1.0, existing['confidence'] + 0.2)
+                existing['has_hint_match'] = True
+            else:
+                candidates.append({
+                    'memory_id': row['memory_id'],
+                    'similarity': row['similarity'],
+                    'relation_type': 'supports' if source_hint in ['decision', 'milestone'] else 'related_to',
+                    'confidence': round(row['similarity'] * 0.8, 4),
+                    'has_hint_match': True
+                })
+    
+    return candidates
+
+
+def process_relation_link_job(job: dict, conn) -> dict:
+    """Process a relation linking job."""
+    correlation_id = generate_correlation_id()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Get memory
+        cur.execute("""
+            SELECT id, tenant_id, content
+            FROM memory_entries 
+            WHERE id = %s
+        """, (job['memory_id'],))
+        
+        row = cur.fetchone()
+        if not row:
+            return {"error": "Memory not found"}
+        
+        memory_id = row['id']
+        tenant_id = row['tenant_id']
+        
+        # Find relation candidates
+        start_time = time.time()
+        candidates = find_relation_candidates(memory_id, tenant_id, cur)
+        
+        if not candidates:
+            return {
+                "status": "no_candidates",
+                "memory_id": memory_id,
+                "relations_created": 0
+            }
+        
+        # Idempotent: delete existing relations from this source
+        cur.execute("""
+            DELETE FROM relations 
+            WHERE source_memory_id = %s AND tenant_id = %s
+        """, (memory_id, tenant_id))
+        
+        # Insert new relations
+        created = 0
+        for candidate in candidates:
+            cur.execute("""
+                INSERT INTO relations 
+                (tenant_id, source_memory_id, object_memory_id, predicate, confidence, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                tenant_id,
+                memory_id,
+                candidate['memory_id'],
+                candidate['relation_type'],
+                candidate['confidence'],
+                json.dumps({
+                    'entity_overlap': candidate.get('entity_overlap'),
+                    'similarity': candidate.get('similarity'),
+                    'has_hint_match': candidate.get('has_hint_match', False)
+                })
+            ))
+            created += 1
+        
+        conn.commit()
+        
+        linking_ms = int((time.time() - start_time) * 1000)
+        
+        log.info("relation_link.completed",
+                 correlation_id=correlation_id,
+                 memory_id=memory_id,
+                 relations_created=created,
+                 linking_ms=linking_ms)
+        
+        metrics.inc("gam_relations_created_total", {"count": str(created)})
+        metrics.observe("gam_relation_link_ms", linking_ms)
+        
+        return {
+            "status": "linked",
+            "memory_id": memory_id,
+            "relations_created": created,
+            "relations": [
+                {
+                    "target_id": c['memory_id'],
+                    "type": c['relation_type'],
+                    "confidence": c['confidence']
+                }
+                for c in candidates
+            ],
+            "linking_ms": linking_ms
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        log.error("relation_link.failed",
+                  correlation_id=correlation_id,
+                  memory_id=job['memory_id'],
+                  error=str(e))
+        raise
+    finally:
+        cur.close()
+
+
 def process_job(job: dict) -> dict:
     """Process a single enrichment job."""
     with get_db() as conn:
@@ -2987,7 +3446,8 @@ def process_job(job: dict) -> dict:
             return process_entity_extract_job(job, conn)
         elif job['job_type'] == 'typed_hint':
             return process_typed_hint_job(job, conn)
-        # Relation linking will be implemented in D.4
+        elif job['job_type'] == 'relation_link':
+            return process_relation_link_job(job, conn)
         else:
             return {"status": "not_implemented", "job_type": job['job_type']}
 
