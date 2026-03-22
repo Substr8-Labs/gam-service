@@ -445,6 +445,33 @@ def run_enrichment_migrations(conn):
             
             conn.commit()
             log.info("db.migrations.enrichment.complete")
+        
+        # V2.7 Retrieval Events table (Holy Smokes demo)
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'retrieval_events'
+            )
+        """)
+        if not cur.fetchone()[0]:
+            log.info("db.migrations.retrieval.running")
+            cur.execute("""
+                CREATE TABLE retrieval_events (
+                    id SERIAL PRIMARY KEY,
+                    memory_id INTEGER REFERENCES memory_entries(id),
+                    tenant_id UUID NOT NULL,
+                    run_id VARCHAR(100),
+                    session_id VARCHAR(100),
+                    retrieved_at TIMESTAMPTZ DEFAULT NOW(),
+                    influenced_response BOOLEAN DEFAULT true,
+                    context JSONB DEFAULT '{}'
+                )
+            """)
+            cur.execute("CREATE INDEX idx_retrieval_memory ON retrieval_events(memory_id)")
+            cur.execute("CREATE INDEX idx_retrieval_tenant ON retrieval_events(tenant_id)")
+            cur.execute("CREATE INDEX idx_retrieval_run ON retrieval_events(run_id)")
+            conn.commit()
+            log.info("db.migrations.retrieval.complete")
     except Exception as e:
         log.error("db.migrations.enrichment.error", error=str(e))
         conn.rollback()
@@ -1848,7 +1875,23 @@ def admin_get_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
                     "typed_hint_at": metadata.get('typed_hint_at'),
                     "entities": get_memory_entities_internal(cur, memory_id, row['tenant_id']),
                     "relations": get_memory_relations_internal(cur, memory_id, row['tenant_id'])
-                }
+                },
+                # Holy Smokes: Source provenance for memory inspection
+                "source": {
+                    "message_excerpt": metadata.get('source_message') or metadata.get('source_message_excerpt'),
+                    "run_id": metadata.get('run_id') or metadata.get('source_run_id'),
+                    "session_id": metadata.get('session_id') or row.get('session_id') or metadata.get('source_session_id'),
+                    "actor": metadata.get('created_by') or metadata.get('source_actor'),
+                    "policy_decision": metadata.get('policy_decision') or metadata.get('store_policy_decision'),
+                    "policy_reason": metadata.get('policy_reason') or metadata.get('store_policy_reason')
+                },
+                # Lineage for supersession
+                "lineage": {
+                    "supersedes": metadata.get('supersedes') or metadata.get('supersedes_memory_id'),
+                    "superseded_by": metadata.get('superseded_by') or metadata.get('superseded_by_memory_id')
+                },
+                # Raw metadata for debugging
+                "raw_metadata": metadata
             }
         finally:
             cur.close()
@@ -2071,6 +2114,115 @@ def admin_reindex_memory(memory_id: int, tenant: dict = Depends(get_tenant)):
                 "memory_id": memory_id,
                 "status": "reindexed",
                 "reindexed_at": metadata['reindexed_at']
+            }
+        finally:
+            cur.close()
+
+
+# ============================================================
+# Holy Smokes: Retrieval Event Tracking
+# ============================================================
+
+class RetrievalEvent(BaseModel):
+    """Record when a memory was retrieved in a run."""
+    run_id: str
+    session_id: Optional[str] = None
+    influenced_response: bool = True
+    context: dict = Field(default_factory=dict)
+
+
+@app.post("/admin/memories/{memory_id}/retrievals")
+def admin_record_retrieval(
+    memory_id: int, 
+    event: RetrievalEvent,
+    tenant: dict = Depends(get_tenant)
+):
+    """Record a retrieval event for a memory (Holy Smokes tracking)."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memory.retrieval.record", 
+             correlation_id=correlation_id, 
+             memory_id=memory_id,
+             run_id=event.run_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            # Verify memory exists
+            cur.execute("SELECT id, tenant_id FROM memory_entries WHERE id = %s", (memory_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            # Record retrieval event
+            cur.execute("""
+                INSERT INTO retrieval_events 
+                (memory_id, tenant_id, run_id, session_id, influenced_response, context)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, retrieved_at
+            """, (memory_id, row['tenant_id'], event.run_id, event.session_id, 
+                  event.influenced_response, json.dumps(event.context)))
+            
+            result = cur.fetchone()
+            conn.commit()
+            
+            return {
+                "event_id": result['id'],
+                "memory_id": memory_id,
+                "run_id": event.run_id,
+                "retrieved_at": result['retrieved_at'].isoformat()
+            }
+        finally:
+            cur.close()
+
+
+@app.get("/admin/memories/{memory_id}/retrievals")
+def admin_get_retrievals(
+    memory_id: int,
+    limit: int = 10,
+    tenant: dict = Depends(get_tenant)
+):
+    """Get retrieval events for a memory (Holy Smokes demo)."""
+    correlation_id = generate_correlation_id()
+    
+    if not tenant:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    log.info("admin.memory.retrievals.list", 
+             correlation_id=correlation_id, 
+             memory_id=memory_id)
+    
+    with get_db(correlation_id) as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        try:
+            cur.execute("""
+                SELECT id, run_id, session_id, retrieved_at, influenced_response, context
+                FROM retrieval_events
+                WHERE memory_id = %s
+                ORDER BY retrieved_at DESC
+                LIMIT %s
+            """, (memory_id, limit))
+            
+            events = []
+            for row in cur.fetchall():
+                events.append({
+                    "event_id": row['id'],
+                    "run_id": row['run_id'],
+                    "session_id": row['session_id'],
+                    "retrieved_at": row['retrieved_at'].isoformat(),
+                    "influenced_response": row['influenced_response'],
+                    "context": row['context'] or {}
+                })
+            
+            return {
+                "memory_id": memory_id,
+                "events": events,
+                "total": len(events)
             }
         finally:
             cur.close()
