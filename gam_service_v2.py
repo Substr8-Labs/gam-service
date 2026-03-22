@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.6.0"
+SERVICE_VERSION = "2.7.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
