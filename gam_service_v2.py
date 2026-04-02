@@ -646,6 +646,82 @@ def run_enrichment_migrations(conn):
             
             conn.commit()
             log.info("db.migrations.canonical_memories.complete")
+        
+        # Always update recall_scoped function to latest version (v1.1 - scope filter fix)
+        log.info("db.migrations.recall_scoped.update")
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION recall_scoped(
+                p_org_id VARCHAR(100),
+                p_project_id VARCHAR(100) DEFAULT NULL,
+                p_agent_id VARCHAR(100) DEFAULT NULL,
+                p_memory_classes memory_class[] DEFAULT NULL,
+                p_min_confidence FLOAT DEFAULT 0.5,
+                p_limit INTEGER DEFAULT 10
+            )
+            RETURNS TABLE (
+                memory_id UUID,
+                content TEXT,
+                summary TEXT,
+                memory_class memory_class,
+                scope memory_scope,
+                confidence FLOAT,
+                source_scope memory_scope,
+                created_at TIMESTAMPTZ
+            ) AS $$
+            BEGIN
+                RETURN QUERY
+                WITH scope_matches AS (
+                    -- Agent scope (only agent-scoped memories)
+                    SELECT cm.memory_id, cm.content, cm.summary, cm.memory_class, 
+                           cm.scope, cm.confidence, cm.created_at,
+                           'agent'::memory_scope as source_scope, 1 as scope_priority
+                    FROM canonical_memories cm
+                    WHERE cm.org_id = p_org_id
+                      AND cm.agent_id = p_agent_id
+                      AND cm.scope = 'agent'
+                      AND cm.status = 'active'
+                      AND cm.confidence >= p_min_confidence
+                      AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
+                      AND p_agent_id IS NOT NULL
+                    
+                    UNION ALL
+                    
+                    -- Project scope (only project-scoped memories)
+                    SELECT cm.memory_id, cm.content, cm.summary, cm.memory_class,
+                           cm.scope, cm.confidence, cm.created_at,
+                           'project'::memory_scope as source_scope, 2 as scope_priority
+                    FROM canonical_memories cm
+                    WHERE cm.org_id = p_org_id
+                      AND cm.project_id = p_project_id
+                      AND cm.scope = 'project'
+                      AND cm.status = 'active'
+                      AND cm.confidence >= p_min_confidence
+                      AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
+                      AND p_project_id IS NOT NULL
+                    
+                    UNION ALL
+                    
+                    -- Org scope (only org-scoped memories)
+                    SELECT cm.memory_id, cm.content, cm.summary, cm.memory_class,
+                           cm.scope, cm.confidence, cm.created_at,
+                           'org'::memory_scope as source_scope, 3 as scope_priority
+                    FROM canonical_memories cm
+                    WHERE cm.org_id = p_org_id
+                      AND cm.scope = 'org'
+                      AND cm.status = 'active'
+                      AND cm.confidence >= p_min_confidence
+                      AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
+                )
+                SELECT sm.memory_id, sm.content, sm.summary, sm.memory_class,
+                       sm.scope, sm.confidence, sm.source_scope, sm.created_at
+                FROM scope_matches sm
+                ORDER BY sm.scope_priority, sm.confidence DESC, sm.created_at DESC
+                LIMIT p_limit;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        conn.commit()
+        log.info("db.migrations.recall_scoped.updated")
     except Exception as e:
         log.error("db.migrations.enrichment.error", error=str(e))
         conn.rollback()
