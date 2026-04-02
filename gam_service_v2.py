@@ -603,6 +603,7 @@ def run_enrichment_migrations(conn):
                         FROM canonical_memories cm
                         WHERE cm.org_id = p_org_id
                           AND cm.agent_id = p_agent_id
+                          AND cm.scope = 'agent'
                           AND cm.status = 'active'
                           AND cm.confidence >= p_min_confidence
                           AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
