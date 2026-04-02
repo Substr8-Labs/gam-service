@@ -4139,7 +4139,7 @@ async def save_recall_envelope(
                 INSERT INTO recall_envelopes (
                     run_id, query, scope_context,
                     retrieval_method, memories_retrieved, memories_injected
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ) VALUES (%s::uuid, %s, %s, %s, %s::uuid[], %s::uuid[])
                 RETURNING id
             """, (
                 request.run_id,
@@ -4158,10 +4158,10 @@ async def save_recall_envelope(
                 cur.execute("""
                     UPDATE canonical_memories 
                     SET 
-                        used_in_runs = array_append(used_in_runs, %s),
+                        used_in_runs = array_append(used_in_runs, %s::uuid),
                         last_recalled_at = NOW(),
                         recall_count = recall_count + 1
-                    WHERE memory_id = %s
+                    WHERE memory_id = %s::uuid
                 """, (request.run_id, memory_id))
             conn.commit()
             
