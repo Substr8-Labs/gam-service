@@ -48,7 +48,7 @@ load_dotenv()
 # ============================================================
 
 SERVICE_NAME = "gam-service"
-SERVICE_VERSION = "2.7.0"
+SERVICE_VERSION = "2.8.0"
 
 DB_HOST = os.getenv("GAM_DB_HOST", os.getenv("PGHOST", "localhost"))
 DB_PORT = int(os.getenv("GAM_DB_PORT", os.getenv("PGPORT", "5432")))
@@ -472,6 +472,179 @@ def run_enrichment_migrations(conn):
             cur.execute("CREATE INDEX idx_retrieval_run ON retrieval_events(run_id)")
             conn.commit()
             log.info("db.migrations.retrieval.complete")
+        
+        # V2.8 Canonical Memories table (Ada Memory Plane v1.2)
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'canonical_memories'
+            )
+        """)
+        if not cur.fetchone()[0]:
+            log.info("db.migrations.canonical_memories.running")
+            
+            # Create enums
+            cur.execute("CREATE TYPE memory_class AS ENUM ('working', 'episodic', 'semantic', 'procedural')")
+            cur.execute("CREATE TYPE memory_scope AS ENUM ('run', 'agent', 'project', 'org')")
+            cur.execute("CREATE TYPE memory_status AS ENUM ('candidate', 'active', 'promoted', 'suppressed', 'archived')")
+            cur.execute("CREATE TYPE source_type AS ENUM ('conversation', 'document', 'run', 'manual', 'promotion', 'system')")
+            
+            # Canonical memories table
+            cur.execute("""
+                CREATE TABLE canonical_memories (
+                    memory_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    memory_version INTEGER NOT NULL DEFAULT 1,
+                    memory_class memory_class NOT NULL,
+                    scope memory_scope NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash VARCHAR(64) NOT NULL,
+                    summary TEXT,
+                    source_type source_type NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    source_channel VARCHAR(50),
+                    actor_id VARCHAR(100) NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ,
+                    org_id VARCHAR(100) NOT NULL,
+                    project_id VARCHAR(100),
+                    agent_id VARCHAR(100),
+                    run_id UUID,
+                    status memory_status NOT NULL DEFAULT 'active',
+                    confidence FLOAT NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
+                    canonical_status_reason TEXT,
+                    access_policy_ref VARCHAR(100),
+                    visibility VARCHAR(20) DEFAULT 'default',
+                    authority_scope memory_scope,
+                    promotion_path TEXT[],
+                    promoted_from UUID REFERENCES canonical_memories(memory_id),
+                    supersedes UUID REFERENCES canonical_memories(memory_id),
+                    related_concepts TEXT[],
+                    related_memories UUID[],
+                    used_in_runs UUID[],
+                    last_recalled_at TIMESTAMPTZ,
+                    recall_count INTEGER DEFAULT 0,
+                    class_metadata JSONB DEFAULT '{}'::jsonb,
+                    UNIQUE(content_hash, org_id, scope, memory_class)
+                )
+            """)
+            
+            # Indexes
+            cur.execute("CREATE INDEX idx_canonical_org ON canonical_memories(org_id)")
+            cur.execute("CREATE INDEX idx_canonical_project ON canonical_memories(org_id, project_id) WHERE project_id IS NOT NULL")
+            cur.execute("CREATE INDEX idx_canonical_agent ON canonical_memories(org_id, agent_id) WHERE agent_id IS NOT NULL")
+            cur.execute("CREATE INDEX idx_canonical_class ON canonical_memories(memory_class)")
+            cur.execute("CREATE INDEX idx_canonical_scope ON canonical_memories(scope)")
+            cur.execute("CREATE INDEX idx_canonical_status ON canonical_memories(status)")
+            cur.execute("CREATE INDEX idx_canonical_active ON canonical_memories(org_id, scope, memory_class) WHERE status = 'active'")
+            cur.execute("CREATE INDEX idx_canonical_concepts ON canonical_memories USING GIN (related_concepts)")
+            
+            # Memory versions table
+            cur.execute("""
+                CREATE TABLE memory_versions (
+                    id SERIAL PRIMARY KEY,
+                    memory_id UUID NOT NULL REFERENCES canonical_memories(memory_id),
+                    version INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash VARCHAR(64) NOT NULL,
+                    changed_by VARCHAR(100) NOT NULL,
+                    changed_at TIMESTAMPTZ DEFAULT NOW(),
+                    change_reason TEXT,
+                    UNIQUE(memory_id, version)
+                )
+            """)
+            cur.execute("CREATE INDEX idx_versions_memory ON memory_versions(memory_id, version DESC)")
+            
+            # Recall envelopes table
+            cur.execute("""
+                CREATE TABLE recall_envelopes (
+                    id SERIAL PRIMARY KEY,
+                    run_id UUID NOT NULL,
+                    recalled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    query TEXT NOT NULL,
+                    scope_context JSONB NOT NULL,
+                    retrieval_method VARCHAR(20) NOT NULL,
+                    memories_retrieved UUID[] NOT NULL,
+                    memories_injected UUID[] NOT NULL,
+                    proof_id UUID,
+                    bound_at TIMESTAMPTZ
+                )
+            """)
+            cur.execute("CREATE INDEX idx_recall_run ON recall_envelopes(run_id)")
+            cur.execute("CREATE INDEX idx_recall_proof ON recall_envelopes(proof_id) WHERE proof_id IS NOT NULL")
+            
+            # Scoped recall function
+            cur.execute("""
+                CREATE OR REPLACE FUNCTION recall_scoped(
+                    p_org_id VARCHAR(100),
+                    p_project_id VARCHAR(100) DEFAULT NULL,
+                    p_agent_id VARCHAR(100) DEFAULT NULL,
+                    p_memory_classes memory_class[] DEFAULT NULL,
+                    p_min_confidence FLOAT DEFAULT 0.5,
+                    p_limit INTEGER DEFAULT 10
+                )
+                RETURNS TABLE (
+                    memory_id UUID,
+                    content TEXT,
+                    summary TEXT,
+                    memory_class memory_class,
+                    scope memory_scope,
+                    confidence FLOAT,
+                    source_scope memory_scope,
+                    created_at TIMESTAMPTZ
+                ) AS $$
+                BEGIN
+                    RETURN QUERY
+                    WITH scope_matches AS (
+                        SELECT cm.memory_id, cm.content, cm.summary, cm.memory_class, 
+                               cm.scope, cm.confidence, cm.created_at,
+                               'agent'::memory_scope as source_scope, 1 as scope_priority
+                        FROM canonical_memories cm
+                        WHERE cm.org_id = p_org_id
+                          AND cm.agent_id = p_agent_id
+                          AND cm.status = 'active'
+                          AND cm.confidence >= p_min_confidence
+                          AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
+                          AND p_agent_id IS NOT NULL
+                        
+                        UNION ALL
+                        
+                        SELECT cm.memory_id, cm.content, cm.summary, cm.memory_class,
+                               cm.scope, cm.confidence, cm.created_at,
+                               'project'::memory_scope as source_scope, 2 as scope_priority
+                        FROM canonical_memories cm
+                        WHERE cm.org_id = p_org_id
+                          AND cm.project_id = p_project_id
+                          AND cm.scope = 'project'
+                          AND cm.status = 'active'
+                          AND cm.confidence >= p_min_confidence
+                          AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
+                          AND p_project_id IS NOT NULL
+                        
+                        UNION ALL
+                        
+                        SELECT cm.memory_id, cm.content, cm.summary, cm.memory_class,
+                               cm.scope, cm.confidence, cm.created_at,
+                               'org'::memory_scope as source_scope, 3 as scope_priority
+                        FROM canonical_memories cm
+                        WHERE cm.org_id = p_org_id
+                          AND cm.scope = 'org'
+                          AND cm.status = 'active'
+                          AND cm.confidence >= p_min_confidence
+                          AND (p_memory_classes IS NULL OR cm.memory_class = ANY(p_memory_classes))
+                    )
+                    SELECT sm.memory_id, sm.content, sm.summary, sm.memory_class,
+                           sm.scope, sm.confidence, sm.source_scope, sm.created_at
+                    FROM scope_matches sm
+                    ORDER BY sm.scope_priority, sm.confidence DESC, sm.created_at DESC
+                    LIMIT p_limit;
+                END;
+                $$ LANGUAGE plpgsql
+            """)
+            
+            conn.commit()
+            log.info("db.migrations.canonical_memories.complete")
     except Exception as e:
         log.error("db.migrations.enrichment.error", error=str(e))
         conn.rollback()
@@ -3732,6 +3905,387 @@ async def start_enrichment_worker():
 @app.on_event("shutdown")
 async def stop_enrichment_worker():
     stop_worker()
+
+
+# ============================================================
+# Ada Memory Plane v1.2 — Canonical Memory API
+# ============================================================
+
+class CanonicalMemoryRequest(BaseModel):
+    """Request to write a canonical memory."""
+    content: str
+    memory_class: str = Field(..., pattern="^(working|episodic|semantic|procedural)$")
+    scope: str = Field(..., pattern="^(run|agent|project|org)$")
+    source_type: str = Field(..., pattern="^(conversation|document|run|manual|promotion|system)$")
+    source_ref: str
+    actor_id: str
+    org_id: str
+    project_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    run_id: Optional[str] = None
+    summary: Optional[str] = None
+    source_channel: Optional[str] = None
+    confidence: float = 0.5
+    related_concepts: Optional[List[str]] = None
+    class_metadata: Optional[Dict[str, Any]] = None
+
+
+class CanonicalMemoryResponse(BaseModel):
+    """Response from canonical memory write."""
+    memory_id: str
+    status: str
+    content_hash: str
+
+
+class ScopedRecallRequest(BaseModel):
+    """Request for scoped memory recall."""
+    org_id: str
+    project_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    memory_classes: Optional[List[str]] = None
+    min_confidence: float = 0.5
+    limit: int = 10
+
+
+class RecallEnvelopeRequest(BaseModel):
+    """Request to save a recall envelope."""
+    run_id: str
+    query: str
+    org_id: str
+    project_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    retrieval_method: str = "gam"
+    memories_retrieved: List[str]
+    memories_injected: List[str]
+
+
+@app.post("/canonical/write", response_model=CanonicalMemoryResponse)
+async def write_canonical_memory(
+    request: CanonicalMemoryRequest,
+    correlation_id: str = Header(default=None, alias="X-Correlation-ID")
+):
+    """
+    Write a memory to the canonical store.
+    
+    This is the single entry point for all durable memory writes.
+    Semantic and procedural memories default to 'candidate' status.
+    """
+    corr_id = correlation_id or str(uuid.uuid4())
+    log.info("canonical.write.start", 
+             correlation_id=corr_id,
+             org_id=request.org_id,
+             memory_class=request.memory_class,
+             scope=request.scope)
+    
+    # Generate content hash
+    content_hash = hashlib.sha256(request.content.encode()).hexdigest()
+    memory_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    
+    # Determine status based on class (per v1.2 spec)
+    if request.memory_class in ('semantic', 'procedural'):
+        # Default to candidate unless high-confidence agent-scope
+        if request.scope == 'agent' and request.confidence >= 0.8:
+            status = 'active'
+        else:
+            status = 'candidate'
+    else:
+        status = 'active'
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO canonical_memories (
+                    memory_id, memory_class, scope,
+                    content, content_hash, summary,
+                    source_type, source_ref, source_channel, actor_id,
+                    created_at, observed_at, updated_at,
+                    org_id, project_id, agent_id, run_id,
+                    status, confidence,
+                    related_concepts, class_metadata
+                ) VALUES (
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    %s, %s
+                )
+                ON CONFLICT (content_hash, org_id, scope, memory_class) 
+                DO UPDATE SET 
+                    updated_at = EXCLUDED.updated_at,
+                    confidence = GREATEST(canonical_memories.confidence, EXCLUDED.confidence)
+                RETURNING memory_id, status
+            """, (
+                memory_id, request.memory_class, request.scope,
+                request.content, content_hash, request.summary,
+                request.source_type, request.source_ref, request.source_channel, request.actor_id,
+                now, now, now,
+                request.org_id, request.project_id, request.agent_id, request.run_id,
+                status, request.confidence,
+                request.related_concepts or [], json.dumps(request.class_metadata or {})
+            ))
+            result = cur.fetchone()
+            conn.commit()
+            
+            log.info("canonical.write.success",
+                     correlation_id=corr_id,
+                     memory_id=result[0],
+                     status=result[1])
+            
+            return CanonicalMemoryResponse(
+                memory_id=result[0],
+                status=result[1],
+                content_hash=content_hash
+            )
+    
+    except Exception as e:
+        log.error("canonical.write.error",
+                  correlation_id=corr_id,
+                  error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+@app.post("/canonical/recall")
+async def recall_scoped_memories(
+    request: ScopedRecallRequest,
+    correlation_id: str = Header(default=None, alias="X-Correlation-ID")
+):
+    """
+    Retrieve memories using scoped inheritance.
+    
+    Order: agent → project → org (procedural before semantic per v1.2 spec).
+    """
+    corr_id = correlation_id or str(uuid.uuid4())
+    log.info("canonical.recall.start",
+             correlation_id=corr_id,
+             org_id=request.org_id,
+             project_id=request.project_id,
+             agent_id=request.agent_id)
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Use the recall_scoped function from migration
+            classes_param = request.memory_classes if request.memory_classes else None
+            
+            cur.execute("""
+                SELECT * FROM recall_scoped(%s, %s, %s, %s::memory_class[], %s, %s)
+            """, (
+                request.org_id,
+                request.project_id,
+                request.agent_id,
+                classes_param,
+                request.min_confidence,
+                request.limit
+            ))
+            
+            results = cur.fetchall()
+            
+            log.info("canonical.recall.success",
+                     correlation_id=corr_id,
+                     result_count=len(results))
+            
+            # Convert to serializable format
+            return {
+                "memories": [dict(r) for r in results],
+                "scopes_searched": ["agent", "project", "org"],
+                "total": len(results)
+            }
+    
+    except Exception as e:
+        log.error("canonical.recall.error",
+                  correlation_id=corr_id,
+                  error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+@app.post("/canonical/recall-envelope")
+async def save_recall_envelope(
+    request: RecallEnvelopeRequest,
+    correlation_id: str = Header(default=None, alias="X-Correlation-ID")
+):
+    """
+    Save a recall envelope for RunProof binding.
+    
+    This records which memories were retrieved and injected into a run.
+    """
+    corr_id = correlation_id or str(uuid.uuid4())
+    log.info("canonical.envelope.start",
+             correlation_id=corr_id,
+             run_id=request.run_id)
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            scope_context = json.dumps({
+                "org_id": request.org_id,
+                "project_id": request.project_id,
+                "agent_id": request.agent_id
+            })
+            
+            cur.execute("""
+                INSERT INTO recall_envelopes (
+                    run_id, query, scope_context,
+                    retrieval_method, memories_retrieved, memories_injected
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                request.run_id,
+                request.query,
+                scope_context,
+                request.retrieval_method,
+                request.memories_retrieved,
+                request.memories_injected
+            ))
+            
+            envelope_id = cur.fetchone()[0]
+            conn.commit()
+            
+            # Update usage tracking on memories
+            for memory_id in request.memories_injected:
+                cur.execute("""
+                    UPDATE canonical_memories 
+                    SET 
+                        used_in_runs = array_append(used_in_runs, %s),
+                        last_recalled_at = NOW(),
+                        recall_count = recall_count + 1
+                    WHERE memory_id = %s
+                """, (request.run_id, memory_id))
+            conn.commit()
+            
+            log.info("canonical.envelope.success",
+                     correlation_id=corr_id,
+                     envelope_id=envelope_id)
+            
+            return {"envelope_id": envelope_id, "status": "saved"}
+    
+    except Exception as e:
+        log.error("canonical.envelope.error",
+                  correlation_id=corr_id,
+                  error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+@app.post("/canonical/bind-proof")
+async def bind_envelope_to_proof(
+    envelope_id: int,
+    proof_id: str,
+    correlation_id: str = Header(default=None, alias="X-Correlation-ID")
+):
+    """Bind a recall envelope to a RunProof."""
+    corr_id = correlation_id or str(uuid.uuid4())
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE recall_envelopes 
+                SET proof_id = %s, bound_at = NOW()
+                WHERE id = %s
+            """, (proof_id, envelope_id))
+            conn.commit()
+            
+            log.info("canonical.bind.success",
+                     correlation_id=corr_id,
+                     envelope_id=envelope_id,
+                     proof_id=proof_id)
+            
+            return {"status": "bound", "envelope_id": envelope_id, "proof_id": proof_id}
+    
+    except Exception as e:
+        log.error("canonical.bind.error", correlation_id=corr_id, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+@app.get("/canonical/{memory_id}")
+async def get_canonical_memory(
+    memory_id: str,
+    correlation_id: str = Header(default=None, alias="X-Correlation-ID")
+):
+    """Get a single canonical memory by ID."""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM canonical_memories WHERE memory_id = %s
+            """, (memory_id,))
+            result = cur.fetchone()
+            
+            if not result:
+                raise HTTPException(status_code=404, detail="Memory not found")
+            
+            return dict(result)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+@app.get("/canonical/stats/{org_id}")
+async def get_canonical_stats(
+    org_id: str,
+    correlation_id: str = Header(default=None, alias="X-Correlation-ID")
+):
+    """Get memory statistics for an org."""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    memory_class,
+                    scope,
+                    status,
+                    COUNT(*) as count,
+                    AVG(confidence) as avg_confidence
+                FROM canonical_memories
+                WHERE org_id = %s
+                GROUP BY memory_class, scope, status
+                ORDER BY memory_class, scope, status
+            """, (org_id,))
+            
+            stats = cur.fetchall()
+            
+            cur.execute("""
+                SELECT COUNT(*) as total FROM canonical_memories WHERE org_id = %s
+            """, (org_id,))
+            total = cur.fetchone()['total']
+            
+            return {
+                "org_id": org_id,
+                "total_memories": total,
+                "breakdown": [dict(s) for s in stats]
+            }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
 
 if __name__ == "__main__":
